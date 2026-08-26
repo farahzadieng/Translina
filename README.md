@@ -8,8 +8,6 @@
 
 </div>
 
----
-
 # About
 
 > **Private, local document translation powered by local LLMs.**
