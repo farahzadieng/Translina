@@ -1,4 +1,16 @@
+<div align="center">
+
 # Translina
+
+**Local models. Local documents. Private translation.**
+
+`Farsi` · `Arabic` · `English`
+
+</div>
+
+---
+
+# About
 
 > **Private, local document translation powered by local LLMs.**
 
@@ -608,19 +620,3 @@ If you find an issue, please include useful information such as:
 Please do **not** include confidential source documents in public bug reports.
 
 ---
-
-# 📜 License
-
-Add the license for your project here.
-
----
-
-<div align="center">
-
-### Translina
-
-**Local models. Local documents. Private translation.**
-
-`Farsi` · `Arabic` · `English`
-
-</div>
