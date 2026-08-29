@@ -41,6 +41,7 @@ from urllib.parse import urlparse
 
 LANGUAGES = {"fa": "فارسی", "en": "English", "ar": "العربية"}
 RTL_LANGUAGES = {"fa", "ar"}
+APP_VERSION = "2.1.0-job-control"
 
 
 class TranslatorError(RuntimeError):
@@ -49,6 +50,10 @@ class TranslatorError(RuntimeError):
 
 class JobCancelled(TranslatorError):
     """Raised at a safe checkpoint when a user cancels a job."""
+
+
+class JobPaused(TranslatorError):
+    """Raised at a safe checkpoint after the user requests a pause."""
 
 
 class ModelCapacityError(TranslatorError):
@@ -656,29 +661,42 @@ def glossary_flags(source: str, target: str, analysis: dict[str, Any]) -> list[s
 class ModelManager:
     """Own exactly one llama.cpp model at a time."""
 
-    def __init__(self, config: dict[str, Any], profile: dict[str, Any]):
+    def __init__(
+        self,
+        config: dict[str, Any],
+        profile: dict[str, Any],
+        status_callback: Any | None = None,
+    ):
         self.config = config
         self.profile = profile
+        self.status_callback = status_callback or (lambda *args: None)
         self._model: Any = None
         self._model_key: str | None = None
         self._lock = threading.RLock()
+
+    def _notify(self, state: str, model_key: str) -> None:
+        self.status_callback(state, model_key)
 
     def _load(self, model_key: str) -> Any:
         with self._lock:
             if self._model is not None and self._model_key == model_key:
                 return self._model
             self.unload()
+            self._notify("loading", model_key)
             try:
                 from llama_cpp import Llama
             except ImportError as exc:
+                self._notify("error", model_key)
                 raise TranslatorError(
                     "llama-cpp-python is not installed. Run 'pip install llama-cpp-python'."
                 ) from exc
             model_config = self.config.get("models", {}).get(model_key)
             if not model_config:
+                self._notify("error", model_key)
                 raise TranslatorError(f"Model '{model_key}' is not configured.")
             model_path = Path(str(model_config.get("path", "")))
             if not model_path.is_file():
+                self._notify("error", model_key)
                 raise TranslatorError(f"Model file not found: {model_path}")
             runtime = self.config.get("runtime", {})
             threads_value = runtime.get("threads", "auto")
@@ -707,10 +725,12 @@ class ModelManager:
             try:
                 self._model = Llama(**kwargs)
             except Exception as exc:
+                self._notify("error", model_key)
                 raise TranslatorError(
                     f"Could not load model '{model_key}': {exc}"
                 ) from exc
             self._model_key = model_key
+            self._notify("loaded", model_key)
             return self._model
 
     def count_tokens(self, model_key: str, text: str) -> int:
@@ -776,6 +796,7 @@ class ModelManager:
     def unload(self) -> None:
         with self._lock:
             model, self._model = self._model, None
+            model_key = self._model_key
             self._model_key = None
             if model is not None:
                 try:
@@ -784,6 +805,8 @@ class ModelManager:
                         close()
                 finally:
                     del model
+                if model_key:
+                    self._notify("unloaded", model_key)
             gc.collect()
 
 
@@ -807,6 +830,7 @@ class TranslationPipeline:
         models: ModelManager,
         progress: Any | None = None,
         cancelled: Any | None = None,
+        paused: Any | None = None,
         checkpoint: Any | None = None,
     ):
         self.config = config
@@ -814,12 +838,15 @@ class TranslationPipeline:
         self.models = models
         self.progress = progress or (lambda *args, **kwargs: None)
         self.cancelled = cancelled or (lambda: False)
+        self.paused = paused or (lambda: False)
         self.checkpoint = checkpoint or (lambda *args, **kwargs: None)
         self.options = config.get("translation", {})
 
     def _check_cancelled(self) -> None:
         if self.cancelled():
             raise JobCancelled("Translation cancelled.")
+        if self.paused():
+            raise JobPaused("Translation paused at a safe checkpoint.")
 
     def _json_call(
         self,
@@ -1946,7 +1973,11 @@ class PdfArtifact:
         direction = direction_for(target_language)
         align = "right" if direction == "rtl" else "left"
         source_font = re.sub(r"^[A-Z]{6}\+", "", str(unit.metadata.get("font", "")))
-        family = fallback if direction == "rtl" else (source_font or fallback)
+        family = (
+            fallback
+            if direction == "rtl" or fallback == "LocalTargetFont"
+            else (source_font or fallback)
+        )
         family = family.replace("'", "")
         margin = "0 0 .7em 0" if include_block_spacing else "0"
         escaped = html.escape(text).replace("\n", "<br>")
@@ -1957,21 +1988,37 @@ class PdfArtifact:
         )
 
     @staticmethod
-    def _html_fits(page: Any, rect: Any, markup: str, min_scale: float) -> bool:
+    def _html_fits(
+        page: Any,
+        rect: Any,
+        markup: str,
+        min_scale: float,
+        css: str = "",
+        archive: Any | None = None,
+    ) -> bool:
         try:
-            result = page.insert_htmlbox(rect, markup, scale_low=min_scale)
+            kwargs: dict[str, Any] = {"scale_low": min_scale}
+            if css:
+                kwargs.update({"css": css, "archive": archive})
+            result = page.insert_htmlbox(rect, markup, **kwargs)
         except (RuntimeError, ValueError):
             return False
         return bool(result and result[0] >= 0)
 
     def _trial_group_fits(
-        self, width: float, height: float, markup: str, min_scale: float
+        self,
+        width: float,
+        height: float,
+        markup: str,
+        min_scale: float,
+        css: str = "",
+        archive: Any | None = None,
     ) -> bool:
         trial = self.fitz.open()
         try:
             page = trial.new_page(width=width, height=height)
             rect = self.fitz.Rect(36, 36, width - 36, height - 36)
-            return self._html_fits(page, rect, markup, min_scale)
+            return self._html_fits(page, rect, markup, min_scale, css, archive)
         finally:
             trial.close()
 
@@ -1984,6 +2031,8 @@ class PdfArtifact:
         target_language: str,
         fallback: str,
         min_scale: float,
+        css: str = "",
+        archive: Any | None = None,
     ) -> None:
         width, height = source_page.rect.width, source_page.rect.height
         readable_scale = max(0.85, min_scale)
@@ -1992,7 +2041,9 @@ class PdfArtifact:
         while pending:
             unit, text = pending.pop(0)
             markup = self._entry_html(unit, text, target_language, fallback)
-            if self._trial_group_fits(width, height, markup, readable_scale):
+            if self._trial_group_fits(
+                width, height, markup, readable_scale, css, archive
+            ):
                 fragments.append((unit, text))
                 continue
             if len(text) <= 1:
@@ -2014,7 +2065,7 @@ class PdfArtifact:
                 for unit, text in proposed
             )
             if current and not self._trial_group_fits(
-                width, height, markup, readable_scale
+                width, height, markup, readable_scale, css, archive
             ):
                 groups.append(current)
                 current = []
@@ -2033,7 +2084,9 @@ class PdfArtifact:
                 self._entry_html(unit, text, target_language, fallback)
                 for unit, text in group
             )
-            if not self._html_fits(page, rect, markup, readable_scale):
+            if not self._html_fits(
+                page, rect, markup, readable_scale, css, archive
+            ):
                 raise TranslatorError(
                     "PDF reflow validation failed while placing translated text."
                 )
@@ -2053,6 +2106,25 @@ class PdfArtifact:
             .get("fallback_fonts", {})
             .get(target_language, "sans-serif")
         )
+        font_css = ""
+        font_archive: Any | None = None
+        font_value = (
+            config.get("documents", {}).get("font_files", {}).get(target_language)
+        )
+        if font_value:
+            font_path = Path(str(font_value))
+            if not font_path.is_file():
+                raise TranslatorError(f"Configured font file not found: {font_path}")
+            try:
+                font_archive = fitz.Archive(str(font_path.parent))
+            except Exception as exc:
+                raise TranslatorError(f"Cannot open configured font: {exc}") from exc
+            font_filename = font_path.name.replace("'", "")
+            font_css = (
+                "@font-face{font-family:'LocalTargetFont';"
+                f"src:url('{font_filename}');}}"
+                "*{font-family:'LocalTargetFont'!important;}"
+            )
         min_scale = float(config.get("documents", {}).get("pdf_min_scale", 0.62))
         by_page: dict[int, list[TranslationUnit]] = {}
         for unit in self.units:
@@ -2085,7 +2157,14 @@ class PdfArtifact:
                     fallback,
                     include_block_spacing=False,
                 )
-                if not self._html_fits(trial_page, rect, markup, min_scale):
+                if not self._html_fits(
+                    trial_page,
+                    rect,
+                    markup,
+                    min_scale,
+                    font_css,
+                    font_archive,
+                ):
                     fixed_layout_fits = False
                     break
             trial.close()
@@ -2110,7 +2189,14 @@ class PdfArtifact:
                         fallback,
                         include_block_spacing=False,
                     )
-                    if not self._html_fits(page, rect, markup, min_scale):
+                    if not self._html_fits(
+                        page,
+                        rect,
+                        markup,
+                        min_scale,
+                        font_css,
+                        font_archive,
+                    ):
                         raise TranslatorError(
                             f"PDF placement changed after preflight for unit {unit.unit_id}."
                         )
@@ -2123,6 +2209,8 @@ class PdfArtifact:
                     target_language,
                     fallback,
                     min_scale,
+                    font_css,
+                    font_archive,
                 )
 
         metadata = source.metadata or {}
@@ -2182,6 +2270,7 @@ def artifact_from_input(
 
 
 TERMINAL_JOB_STATES = {"completed", "failed", "cancelled"}
+STREAM_END_STATES = TERMINAL_JOB_STATES | {"paused"}
 JOB_PUBLIC_FIELDS = {
     "id",
     "status",
@@ -2197,6 +2286,12 @@ JOB_PUBLIC_FIELDS = {
     "output_name",
     "created_at",
     "updated_at",
+    "heartbeat_at",
+    "paused_from_stage",
+    "profile_name",
+    "model_key",
+    "model_state",
+    "backend",
 }
 
 
@@ -2285,8 +2380,47 @@ class JobStore:
                     output_path TEXT NOT NULL,
                     output_name TEXT NOT NULL,
                     cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    pause_requested INTEGER NOT NULL DEFAULT 0,
+                    paused_from_stage TEXT NOT NULL DEFAULT '',
+                    heartbeat_at REAL NOT NULL DEFAULT 0,
+                    profile_name TEXT NOT NULL DEFAULT '',
+                    model_key TEXT NOT NULL DEFAULT '',
+                    model_state TEXT NOT NULL DEFAULT 'not_loaded',
+                    backend TEXT NOT NULL DEFAULT '',
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
+                )
+                """
+            )
+            existing = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+            }
+            migrations = {
+                "pause_requested": "INTEGER NOT NULL DEFAULT 0",
+                "paused_from_stage": "TEXT NOT NULL DEFAULT ''",
+                "heartbeat_at": "REAL NOT NULL DEFAULT 0",
+                "profile_name": "TEXT NOT NULL DEFAULT ''",
+                "model_key": "TEXT NOT NULL DEFAULT ''",
+                "model_state": "TEXT NOT NULL DEFAULT 'not_loaded'",
+                "backend": "TEXT NOT NULL DEFAULT ''",
+            }
+            for column, definition in migrations.items():
+                if column not in existing:
+                    connection.execute(
+                        f"ALTER TABLE jobs ADD COLUMN {column} {definition}"
+                    )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS job_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    progress INTEGER NOT NULL,
+                    message TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
                 )
                 """
             )
@@ -2311,8 +2445,9 @@ class JobStore:
                 INSERT INTO jobs (
                     id, status, stage, progress, message, error, input_type, original_name,
                     source_path, source_text, source_language, target_language, tone,
-                    custom_instruction, output_path, output_name, created_at, updated_at
-                ) VALUES (?, 'queued', 'queued', 0, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?)
+                    custom_instruction, output_path, output_name, heartbeat_at,
+                    created_at, updated_at
+                ) VALUES (?, 'queued', 'queued', 0, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -2327,7 +2462,13 @@ class JobStore:
                     custom_instruction,
                     now,
                     now,
+                    now,
                 ),
+            )
+            connection.execute(
+                "INSERT INTO job_events (job_id,status,stage,progress,message,created_at) "
+                "VALUES (?, 'queued', 'queued', 0, ?, ?)",
+                (job_id, "در صف پردازش", now),
             )
         return job_id
 
@@ -2339,7 +2480,45 @@ class JobStore:
         return dict(row) if row else None
 
     def public(self, job: dict[str, Any]) -> dict[str, Any]:
-        return {key: job.get(key) for key in JOB_PUBLIC_FIELDS}
+        value = {key: job.get(key) for key in JOB_PUBLIC_FIELDS}
+        heartbeat = float(job.get("heartbeat_at") or job.get("updated_at") or 0)
+        heartbeat_age = max(0.0, time.time() - heartbeat)
+        progress_age = max(0.0, time.time() - float(job.get("updated_at") or 0))
+        value["heartbeat_age_seconds"] = round(heartbeat_age, 1)
+        value["progress_age_seconds"] = round(progress_age, 1)
+        status = str(job.get("status", ""))
+        if status in {"running", "pausing"} and heartbeat_age > 10:
+            health_state = "worker_unresponsive"
+        elif status in {"running", "pausing"} and progress_age > 120:
+            health_state = "long_running"
+        elif status in {"running", "pausing"}:
+            health_state = "working"
+        else:
+            health_state = status or "unknown"
+        value["health_state"] = health_state
+        value["is_stalled"] = health_state in {
+            "worker_unresponsive",
+            "long_running",
+        }
+        value["history"] = self.history(str(job["id"]))
+        return value
+
+    def list_jobs(self, limit: int = 30) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?",
+                (max(1, min(100, int(limit))),),
+            ).fetchall()
+        return [self.public(dict(row)) for row in rows]
+
+    def history(self, job_id: str, limit: int = 30) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT status,stage,progress,message,created_at FROM job_events "
+                "WHERE job_id=? ORDER BY id DESC LIMIT ?",
+                (job_id, max(1, min(100, int(limit)))),
+            ).fetchall()
+        return [dict(row) for row in reversed(rows)]
 
     def update(self, job_id: str, **changes: Any) -> None:
         allowed = {
@@ -2351,6 +2530,13 @@ class JobStore:
             "output_path",
             "output_name",
             "cancel_requested",
+            "pause_requested",
+            "paused_from_stage",
+            "heartbeat_at",
+            "profile_name",
+            "model_key",
+            "model_state",
+            "backend",
         }
         values = {key: value for key, value in changes.items() if key in allowed}
         if not values:
@@ -2364,11 +2550,101 @@ class JobStore:
                 f"UPDATE jobs SET {assignments} WHERE id = ?",
                 [*values.values(), job_id],
             )
+            if any(
+                key in values for key in ("status", "stage", "progress", "message")
+            ):
+                row = connection.execute(
+                    "SELECT status,stage,progress,message FROM jobs WHERE id=?",
+                    (job_id,),
+                ).fetchone()
+                if row:
+                    previous = connection.execute(
+                        "SELECT status,stage,progress,message FROM job_events "
+                        "WHERE job_id=? ORDER BY id DESC LIMIT 1",
+                        (job_id,),
+                    ).fetchone()
+                    snapshot = tuple(row)
+                    if previous is None or tuple(previous) != snapshot:
+                        connection.execute(
+                            "INSERT INTO job_events "
+                            "(job_id,status,stage,progress,message,created_at) "
+                            "VALUES (?,?,?,?,?,?)",
+                            (job_id, *snapshot, time.time()),
+                        )
+
+    def touch_heartbeat(self, job_id: str) -> None:
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE jobs SET heartbeat_at=? WHERE id=?", (now, job_id)
+            )
+
+    def request_pause(self, job_id: str) -> bool:
+        job = self.get(job_id)
+        if not job or job["status"] not in {"queued", "running", "pausing"}:
+            return False
+        if job["status"] == "queued":
+            self.update(
+                job_id,
+                status="paused",
+                pause_requested=0,
+                paused_from_stage=job["stage"],
+                message="تسک پیش از شروع متوقف شد",
+            )
+        else:
+            self.update(
+                job_id,
+                status="pausing",
+                pause_requested=1,
+                message="درخواست توقف ثبت شد؛ منتظر رسیدن به مرز امن",
+            )
+        return True
+
+    def is_pause_requested(self, job_id: str) -> bool:
+        job = self.get(job_id)
+        return bool(job and job.get("pause_requested"))
+
+    def mark_paused(self, job_id: str) -> None:
+        job = self.get(job_id)
+        if not job:
+            return
+        self.update(
+            job_id,
+            status="paused",
+            pause_requested=0,
+            paused_from_stage=job["stage"],
+            message=f"در مرحلهٔ {job['stage']} متوقف شد؛ آمادهٔ ادامه",
+        )
+
+    def resume(self, job_id: str) -> bool:
+        job = self.get(job_id)
+        if not job or job["status"] != "paused":
+            return False
+        stage = str(job.get("paused_from_stage") or job.get("stage") or "queued")
+        self.update(
+            job_id,
+            status="queued",
+            stage=stage,
+            pause_requested=0,
+            cancel_requested=0,
+            error="",
+            message=f"در صف ادامه از مرحلهٔ {stage}",
+        )
+        return True
 
     def request_cancel(self, job_id: str) -> bool:
         job = self.get(job_id)
         if not job or job["status"] in TERMINAL_JOB_STATES:
             return False
+        if job["status"] in {"queued", "paused"}:
+            self.update(
+                job_id,
+                status="cancelled",
+                stage="cancelled",
+                cancel_requested=1,
+                message="ترجمه لغو شد",
+            )
+            return True
         self.update(job_id, cancel_requested=1, message="درخواست لغو ثبت شد")
         return True
 
@@ -2379,20 +2655,60 @@ class JobStore:
     def recoverable(self) -> list[str]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT id FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at"
+                "SELECT id,stage FROM jobs "
+                "WHERE status IN ('queued','running','pausing') ORDER BY created_at"
             ).fetchall()
-            connection.execute(
-                "UPDATE jobs SET status='queued', stage='queued', message='بازیابی پس از راه‌اندازی مجدد' "
-                "WHERE status='running'"
+        for row in rows:
+            self.update(
+                str(row["id"]),
+                status="paused",
+                pause_requested=0,
+                cancel_requested=0,
+                paused_from_stage=str(row["stage"]),
+                model_state="unloaded",
+                message="پس از راه‌اندازی مجدد متوقف ماند؛ برای ادامه Resume را بزنید",
             )
-        return [str(row["id"]) for row in rows]
+        return []
 
     def active_count(self) -> int:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('queued', 'running')"
+                "SELECT COUNT(*) AS count FROM jobs "
+                "WHERE status IN ('queued','running','pausing')"
             ).fetchone()
         return int(row["count"] if row else 0)
+
+    def delete_job(self, job_id: str) -> bool:
+        job = self.get(job_id)
+        if not job or job["status"] not in TERMINAL_JOB_STATES | {"paused"}:
+            return False
+        with self._connect() as connection:
+            connection.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+        job_dir = self.jobs_dir / job_id
+        if job_dir.is_dir():
+            shutil.rmtree(job_dir, ignore_errors=True)
+        source_value = str(job.get("source_path") or "")
+        if source_value:
+            source = Path(source_value)
+            uploads_root = (self.data_dir / "uploads").resolve()
+            try:
+                resolved = source.resolve()
+                if resolved.is_relative_to(uploads_root) and resolved.is_file():
+                    resolved.unlink()
+            except OSError:
+                pass
+        return True
+
+    def clear_deletable(self) -> int:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id FROM jobs WHERE status IN "
+                "('paused','completed','failed','cancelled')"
+            ).fetchall()
+        deleted = 0
+        for row in rows:
+            deleted += int(self.delete_job(str(row["id"])))
+        return deleted
 
     def cleanup(self, retention_days: int) -> None:
         cutoff = time.time() - max(1, retention_days) * 86400
@@ -2472,7 +2788,7 @@ class JobRunner:
 
     def _process(self, job_id: str) -> None:
         job = self.store.get(job_id)
-        if not job or job["status"] in TERMINAL_JOB_STATES:
+        if not job or job["status"] in TERMINAL_JOB_STATES | {"paused"}:
             return
         if self.store.is_cancelled(job_id):
             self.store.update(
@@ -2488,8 +2804,32 @@ class JobRunner:
         )
         profile_name = ""
         model_manager: ModelManager | None = None
+        heartbeat_stop = threading.Event()
+
+        def heartbeat() -> None:
+            while not heartbeat_stop.wait(2):
+                current = self.store.get(job_id)
+                if not current or current["status"] not in {"running", "pausing"}:
+                    return
+                self.store.touch_heartbeat(job_id)
+
+        heartbeat_thread = threading.Thread(
+            target=heartbeat,
+            name=f"translator-heartbeat-{job_id[:8]}",
+            daemon=True,
+        )
+        self.store.touch_heartbeat(job_id)
+        heartbeat_thread.start()
         try:
             profile_name, profile = choose_profile(self.config)
+            backend = detect_runtime_backend()
+            self.store.update(
+                job_id,
+                profile_name=profile_name,
+                model_key=str(profile.get("translator", "")),
+                model_state="not_loaded",
+                backend=backend,
+            )
             input_source: str | Path = (
                 job["source_text"]
                 if job["input_type"] == "text"
@@ -2513,13 +2853,55 @@ class JobRunner:
             def save(stage: str, values: dict[str, Any]) -> None:
                 self._save_checkpoint(job_id, stage, values)
 
-            model_manager = ModelManager(self.config, profile)
+            previous_model_stage = ["analysis"]
+
+            def model_status(state: str, model_key: str) -> None:
+                current = self.store.get(job_id) or {}
+                progress = int(current.get("progress") or 5)
+                if state == "loading":
+                    stage = str(current.get("stage") or "analysis")
+                    if stage != "loading_model":
+                        previous_model_stage[0] = stage
+                    self.store.update(
+                        job_id,
+                        stage="loading_model",
+                        progress=max(5, progress),
+                        message=f"در حال بارگذاری مدل {model_key} روی {backend}",
+                        model_key=model_key,
+                        model_state="loading",
+                        backend=backend,
+                    )
+                elif state == "loaded":
+                    self.store.update(
+                        job_id,
+                        stage=previous_model_stage[0],
+                        message=f"مدل {model_key} با موفقیت بارگذاری شد؛ پردازش ادامه دارد",
+                        model_key=model_key,
+                        model_state="loaded",
+                        backend=backend,
+                    )
+                elif state == "error":
+                    self.store.update(
+                        job_id,
+                        stage="model_error",
+                        message=f"بارگذاری مدل {model_key} ناموفق بود",
+                        model_key=model_key,
+                        model_state="error",
+                        backend=backend,
+                    )
+                else:
+                    self.store.update(job_id, model_state="unloaded")
+
+            model_manager = ModelManager(
+                self.config, profile, status_callback=model_status
+            )
             pipeline = TranslationPipeline(
                 self.config,
                 profile,
                 model_manager,
                 progress=report,
                 cancelled=lambda: self.store.is_cancelled(job_id),
+                paused=lambda: self.store.is_pause_requested(job_id),
                 checkpoint=save,
             )
             checkpoint = self._load_checkpoint(job_id)
@@ -2532,6 +2914,8 @@ class JobRunner:
                     job["custom_instruction"],
                     resume=checkpoint,
                 )
+            except (JobCancelled, JobPaused):
+                raise
             except TranslatorError:
                 if profile_name != "high":
                     raise
@@ -2544,13 +2928,16 @@ class JobRunner:
                     stage="fallback",
                     message="مدل پرحافظه اجرا نشد؛ ادامه با پروفایل کم‌حافظه",
                 )
-                model_manager = ModelManager(self.config, low)
+                model_manager = ModelManager(
+                    self.config, low, status_callback=model_status
+                )
                 pipeline = TranslationPipeline(
                     self.config,
                     low,
                     model_manager,
                     progress=report,
                     cancelled=lambda: self.store.is_cancelled(job_id),
+                    paused=lambda: self.store.is_pause_requested(job_id),
                     checkpoint=save,
                 )
                 translations = pipeline.run(
@@ -2590,6 +2977,8 @@ class JobRunner:
             self.store.update(
                 job_id, status="cancelled", stage="cancelled", message="ترجمه لغو شد"
             )
+        except JobPaused:
+            self.store.mark_paused(job_id)
         except Exception as exc:  # noqa: BLE001 - worker boundary must persist every failure
             self.store.update(
                 job_id,
@@ -2599,6 +2988,7 @@ class JobRunner:
                 error=str(exc),
             )
         finally:
+            heartbeat_stop.set()
             if model_manager is not None:
                 model_manager.unload()
             try:
@@ -2684,6 +3074,7 @@ def build_doctor_report(
 
     healthy = not errors and backend != "unavailable"
     return {
+        "app_version": APP_VERSION,
         "status": "ok" if healthy else "incomplete",
         "platform": platform.platform(),
         "memory_gb": round(total_memory_bytes() / 1024**3, 1),
@@ -2704,18 +3095,21 @@ INDEX_HTML = r"""<!doctype html>
   <meta name="csrf-token" content="__CSRF_TOKEN__">
   <title>مترجم محلی اسناد</title>
   <style>
+    @font-face{font-family:Vazirmatn;src:url('/assets/app-font') format('truetype');font-display:swap}
     :root{--ink:#192522;--muted:#63716d;--paper:#f4f1e8;--card:#fffdf7;--line:#d9d4c6;--accent:#0f766e;--accent2:#115e59;--danger:#b42318}
-    *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,#d7ebe2 0,transparent 35%),var(--paper);color:var(--ink);font-family:Tahoma,"Noto Sans Arabic",sans-serif;min-height:100vh}
+    *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,#d7ebe2 0,transparent 35%),var(--paper);color:var(--ink);font-family:Vazirmatn,Tahoma,"Noto Sans Arabic",sans-serif;min-height:100vh}
     main{width:min(920px,calc(100% - 28px));margin:42px auto}.eyebrow{color:var(--accent);font-weight:700;font-size:.82rem;letter-spacing:.08em}h1{font-size:clamp(2rem,5vw,3.5rem);margin:.3rem 0 .7rem;line-height:1.15}header p{color:var(--muted);max-width:680px;line-height:1.9}
     .card{background:rgba(255,253,247,.94);border:1px solid var(--line);border-radius:22px;padding:24px;box-shadow:0 18px 55px rgba(25,37,34,.09);margin-top:25px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.full{grid-column:1/-1}
     label{display:block;font-weight:700;font-size:.9rem;margin-bottom:8px}select,textarea,input[type=file],input[type=text]{width:100%;border:1px solid var(--line);border-radius:12px;background:#fff;padding:12px;color:var(--ink);font:inherit}textarea{min-height:160px;resize:vertical;line-height:1.8}select:focus,textarea:focus,input:focus{outline:3px solid rgba(15,118,110,.14);border-color:var(--accent)}
-    .switch{display:flex;gap:8px;margin-bottom:12px}.switch button{background:#ece8dc;color:var(--muted);border:0;padding:8px 14px;border-radius:999px;cursor:pointer}.switch button.active{background:var(--ink);color:white}.actions{display:flex;gap:10px;align-items:center;margin-top:18px}button.primary,a.download{background:var(--accent);color:#fff;border:0;border-radius:12px;padding:12px 20px;font:inherit;font-weight:700;cursor:pointer;text-decoration:none}button.primary:hover,a.download:hover{background:var(--accent2)}button.secondary{background:transparent;border:1px solid var(--line);border-radius:12px;padding:11px 18px;color:var(--danger);cursor:pointer}.hidden{display:none!important}
-    #statusCard{overflow:hidden}.statusline{display:flex;justify-content:space-between;gap:16px;align-items:center}.percent{font-size:2rem;font-weight:800;color:var(--accent)}.track{height:12px;background:#e5e1d6;border-radius:999px;margin:18px 0;overflow:hidden}.bar{height:100%;width:0;background:linear-gradient(90deg,var(--accent),#2dd4bf);transition:width .35s ease}.muted{color:var(--muted);font-size:.9rem}.error{color:var(--danger);white-space:pre-wrap;line-height:1.7}.footer{margin:22px 4px;color:var(--muted);font-size:.8rem}.ltr{direction:ltr;text-align:left}
-    @media(max-width:700px){main{margin:24px auto}.card{padding:18px}.grid{grid-template-columns:1fr}.full{grid-column:auto}.statusline{align-items:flex-start}.actions{flex-wrap:wrap}}
+    .switch{display:flex;gap:8px;margin-bottom:12px}.switch button{background:#ece8dc;color:var(--muted);border:0;padding:8px 14px;border-radius:999px;cursor:pointer}.switch button.active{background:var(--ink);color:white}.actions{display:flex;gap:10px;align-items:center;margin-top:18px;flex-wrap:wrap}button.primary,a.download{background:var(--accent);color:#fff;border:0;border-radius:12px;padding:12px 20px;font:inherit;font-weight:700;cursor:pointer;text-decoration:none}button.primary:hover,a.download:hover{background:var(--accent2)}button.secondary{background:transparent;border:1px solid var(--line);border-radius:12px;padding:11px 18px;color:var(--danger);cursor:pointer;font:inherit}button.neutral{color:var(--ink)}.hidden{display:none!important}
+    #statusCard{overflow:hidden}.statusline{display:flex;justify-content:space-between;gap:16px;align-items:center}.percent{font-size:2rem;font-weight:800;color:var(--accent)}.track{height:12px;background:#e5e1d6;border-radius:999px;margin:18px 0;overflow:hidden}.bar{height:100%;width:0;background:linear-gradient(90deg,var(--accent),#2dd4bf);transition:width .35s ease}.muted{color:var(--muted);font-size:.9rem}.error{color:var(--danger);white-space:pre-wrap;line-height:1.7}.details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 18px;background:#f3f0e7;border-radius:14px;padding:14px;margin-top:14px}.details div{font-size:.88rem}.health{margin-top:12px;padding:10px 12px;border-radius:10px;background:#e7f5ef;color:#0b5f55}.health.warn{background:#fff0d8;color:#8a4b08}.health.bad{background:#fee9e7;color:var(--danger)}.process{margin-top:14px;line-height:1.9}.history{margin:12px 0 0;padding:0 18px 0 0;max-height:210px;overflow:auto}.history li{margin:6px 0;color:var(--muted);font-size:.84rem}.jobs{display:grid;gap:8px;margin-top:12px}.jobrow{display:flex;justify-content:space-between;gap:12px;align-items:center;width:100%;text-align:right;border:1px solid var(--line);background:#fff;border-radius:12px;padding:10px 12px;font:inherit;cursor:pointer}.jobrow:hover{border-color:var(--accent)}.footer{margin:22px 4px;color:var(--muted);font-size:.8rem}.ltr{direction:ltr;text-align:left}
+    button:focus-visible,a:focus-visible{outline:3px solid rgba(15,118,110,.28);outline-offset:2px}
+    @media(max-width:700px){main{margin:24px auto}.card{padding:18px}.grid,.details{grid-template-columns:1fr}.full{grid-column:auto}.statusline{align-items:flex-start}.actions{flex-wrap:wrap}}
+    @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
   </style>
 </head>
 <body><main>
-  <header><div class="eyebrow">LOCAL · PRIVATE · ADAPTIVE</div><h1>مترجم محلی اسناد</h1><p>ترجمهٔ طبیعی و چندمرحله‌ای با مدل‌های GGUF شما؛ همراه با حفظ ساختار Word، بازسازی PDF و نمایش زندهٔ پیشرفت.</p></header>
+  <header><div class="eyebrow">LOCAL · PRIVATE · ADAPTIVE · نسخه __APP_VERSION__</div><h1>مترجم محلی اسناد</h1><p>ترجمهٔ طبیعی و چندمرحله‌ای با مدل‌های GGUF شما؛ همراه با حفظ ساختار Word، بازسازی PDF و نمایش زندهٔ پیشرفت.</p><div id="runtimeHealth" class="muted">در حال بررسی آمادگی سیستم…</div></header>
   <section class="card" id="formCard"><form id="jobForm"><input type="hidden" name="csrf_token" value="__CSRF_TOKEN__">
     <div class="switch"><button type="button" class="active" data-type="text">متن</button><button type="button" data-type="docx">Word</button><button type="button" data-type="pdf">PDF</button></div>
     <input type="hidden" name="input_type" id="inputType" value="text">
@@ -2729,16 +3123,53 @@ INDEX_HTML = r"""<!doctype html>
     </div>
     <div class="actions"><button class="primary" type="submit" id="start">شروع ترجمه</button><span class="muted" id="formMessage"></span></div>
   </form></section>
-  <section class="card hidden" id="statusCard"><div class="statusline"><div><strong id="stage">آماده‌سازی</strong><div class="muted" id="message"></div></div><div class="percent"><span id="percent">0</span>٪</div></div><div class="track"><div class="bar" id="bar"></div></div><div id="error" class="error"></div><div class="actions"><button id="cancel" class="secondary" type="button">لغو</button><a id="download" class="download hidden">دانلود فایل ترجمه‌شده</a></div></section>
+  <section class="card hidden" id="statusCard">
+    <div class="statusline"><div><strong id="stage">آماده‌سازی</strong><div class="muted" id="message"></div></div><div class="percent"><span id="percent">0</span>٪</div></div>
+    <div class="track"><div class="bar" id="bar"></div></div>
+    <div id="health" class="health">سلامت اجرا: در حال بررسی</div>
+    <div class="details"><div>وضعیت: <strong id="jobStatus">—</strong></div><div>آخرین مرحله: <strong id="pausedStage">—</strong></div><div>مدل: <strong id="model">—</strong></div><div>وضعیت مدل: <strong id="modelState">—</strong></div><div>Backend: <strong id="backend">—</strong></div><div>آخرین پیشرفت: <strong id="lastProgress">—</strong></div></div>
+    <div class="process"><strong>فرایند:</strong> آماده‌سازی ← بارگذاری مدل ← تحلیل ← ترجمه ← ویرایش ← کنترل کیفیت ← ساخت خروجی</div>
+    <div id="error" class="error"></div>
+    <div class="actions"><button id="pause" class="secondary neutral" type="button">توقف امن</button><button id="resume" class="primary hidden" type="button">ادامه</button><button id="cancel" class="secondary" type="button">لغو کامل</button><button id="delete" class="secondary hidden" type="button">حذف تسک</button><button id="newTask" class="secondary neutral" type="button">تسک جدید</button><a id="download" class="download hidden">دانلود فایل ترجمه‌شده</a></div>
+    <details><summary>تاریخچهٔ مراحل</summary><ol id="history" class="history"></ol></details>
+  </section>
+  <section class="card"><div class="statusline"><strong>تسک‌های اخیر</strong><button id="clearJobs" class="secondary" type="button">پاک‌کردن تسک‌های قابل حذف</button></div><div id="jobs" class="jobs"><span class="muted">تسکی ثبت نشده است.</span></div></section>
   <div class="footer">فایل‌ها و مدل‌ها روی همین دستگاه پردازش می‌شوند.</div>
 </main><script>
-const form=document.getElementById('jobForm'), inputType=document.getElementById('inputType'), textInput=document.getElementById('textInput'), fileInput=document.getElementById('fileInput'), csrfToken=document.querySelector('meta[name="csrf-token"]').content;let currentJob=null, events=null;
+const form=document.getElementById('jobForm'),inputType=document.getElementById('inputType'),textInput=document.getElementById('textInput'),fileInput=document.getElementById('fileInput'),csrfToken=document.querySelector('meta[name="csrf-token"]').content;
+let currentJob=null,events=null;
+const terminal=['completed','failed','cancelled'];
+const stageNames={queued:'در صف',preparing:'آماده‌سازی',structure:'استخراج ساختار',loading_model:'بارگذاری مدل',model_error:'خطای مدل',analysis:'تحلیل متن',manifest:'ثبت checkpoint',translation:'ترجمهٔ اولیه',draft:'ترجمهٔ اولیه',context:'به‌روزرسانی حافظه',editing:'ویرایش',quality:'کنترل کیفیت',quality_repair:'اصلاح کیفیت',fallback:'مدل جایگزین',rebuilding:'ساخت خروجی',completed:'تکمیل‌شده',paused:'متوقف',failed:'خطا',cancelled:'لغوشده'};
+const statusNames={queued:'در صف',running:'در حال اجرا',pausing:'در انتظار توقف امن',paused:'متوقف',completed:'تکمیل‌شده',failed:'ناموفق',cancelled:'لغوشده'};
+const modelNames={not_loaded:'هنوز بارگذاری نشده',loading:'در حال بارگذاری',loaded:'بارگذاری شده',unloaded:'از حافظه خارج شده',error:'خطای بارگذاری'};
 document.querySelectorAll('.switch button').forEach(btn=>btn.onclick=()=>{document.querySelectorAll('.switch button').forEach(x=>x.classList.remove('active'));btn.classList.add('active');inputType.value=btn.dataset.type;const isText=btn.dataset.type==='text';textInput.classList.toggle('hidden',!isText);fileInput.classList.toggle('hidden',isText);document.getElementById('file').accept=btn.dataset.type==='docx'?'.docx':btn.dataset.type==='pdf'?'.pdf':'';});
-function showState(job){document.getElementById('statusCard').classList.remove('hidden');document.getElementById('stage').textContent=job.stage||job.status;document.getElementById('message').textContent=job.message||'';document.getElementById('percent').textContent=job.progress||0;document.getElementById('bar').style.width=(job.progress||0)+'%';document.getElementById('error').textContent=job.error||'';const done=job.status==='completed';document.getElementById('download').classList.toggle('hidden',!done);document.getElementById('cancel').classList.toggle('hidden',['completed','failed','cancelled'].includes(job.status));if(done)document.getElementById('download').href='/api/jobs/'+job.id+'/download';}
-function connectJob(jobId){currentJob=jobId;localStorage.setItem('translatorJobId',jobId);if(events)events.close();events=new EventSource('/api/jobs/'+jobId+'/events');events.addEventListener('progress',e=>{const job=JSON.parse(e.data);showState(job);if(['completed','failed','cancelled'].includes(job.status))events.close()});events.onerror=()=>{document.getElementById('message').textContent='ارتباط وضعیت موقتاً قطع شد؛ اتصال مجدد خودکار انجام می‌شود.'};}
-form.onsubmit=async e=>{e.preventDefault();document.getElementById('formMessage').textContent='';document.getElementById('error').textContent='';const res=await fetch('/api/jobs',{method:'POST',body:new FormData(form)});const data=await res.json();if(!res.ok){document.getElementById('formMessage').textContent=data.error||'خطا در ثبت کار';return}document.getElementById('statusCard').classList.remove('hidden');connectJob(data.job_id);};
-document.getElementById('cancel').onclick=async()=>{if(currentJob)await fetch('/api/jobs/'+currentJob+'/cancel',{method:'POST',headers:{'X-CSRF-Token':csrfToken}})};
-const savedJob=localStorage.getItem('translatorJobId');if(savedJob){fetch('/api/jobs/'+savedJob).then(async res=>{if(!res.ok){localStorage.removeItem('translatorJobId');return}const job=await res.json();showState(job);if(!['completed','failed','cancelled'].includes(job.status))connectJob(savedJob);else currentJob=savedJob;});}
+function setText(id,value){document.getElementById(id).textContent=(value===null||value===undefined)?'—':value}
+function showState(job){
+  currentJob=job.id;localStorage.setItem('translatorJobId',job.id);document.getElementById('statusCard').classList.remove('hidden');
+  setText('stage',stageNames[job.stage]||job.stage||job.status);setText('message',job.message||'');setText('jobStatus',statusNames[job.status]||job.status);setText('pausedStage',stageNames[job.paused_from_stage]||job.paused_from_stage);setText('model',job.model_key);setText('modelState',modelNames[job.model_state]||job.model_state);setText('backend',job.backend);setText('lastProgress',Math.round(job.progress_age_seconds||0)+' ثانیه پیش');
+  document.getElementById('percent').textContent=job.progress||0;document.getElementById('bar').style.width=(job.progress||0)+'%';document.getElementById('error').textContent=job.error||'';
+  const health=document.getElementById('health');health.className='health';
+  if(job.health_state==='worker_unresponsive'){health.textContent='سلامت اجرا: heartbeat پردازش قطع شده؛ احتمال توقف Worker وجود دارد.';health.classList.add('bad')}
+  else if(job.health_state==='long_running'){health.textContent='سلامت اجرا: برنامه زنده است، اما بیش از دو دقیقه پیشرفت مرحله‌ای ثبت نشده؛ inference ممکن است طولانی یا متوقف شده باشد.';health.classList.add('warn')}
+  else if(job.health_state==='working'){health.textContent='سلامت اجرا: Worker پاسخگو است و پردازش ادامه دارد.'}
+  else if(job.status==='paused'){health.textContent='سلامت اجرا: تسک عمداً متوقف است و مدل از حافظه خارج می‌شود.'}
+  else if(job.status==='queued'){health.textContent='سلامت اجرا: تسک در صف است و هنوز مدل را اشغال نکرده.'}
+  else{health.textContent='سلامت اجرا: '+(statusNames[job.status]||job.status)}
+  const done=job.status==='completed',paused=job.status==='paused',active=['queued','running','pausing'].includes(job.status),deletable=paused||terminal.includes(job.status);
+  document.getElementById('download').classList.toggle('hidden',!done);document.getElementById('pause').classList.toggle('hidden',!['queued','running'].includes(job.status));document.getElementById('resume').classList.toggle('hidden',!paused);document.getElementById('cancel').classList.toggle('hidden',!active&&!paused);document.getElementById('delete').classList.toggle('hidden',!deletable);if(done)document.getElementById('download').href='/api/jobs/'+job.id+'/download';
+  const history=document.getElementById('history');history.replaceChildren();(job.history||[]).slice(-12).reverse().forEach(item=>{const li=document.createElement('li');li.textContent=(stageNames[item.stage]||item.stage)+' — '+item.progress+'٪ — '+item.message;history.appendChild(li)});
+}
+async function loadJobs(){const res=await fetch('/api/jobs');if(!res.ok)return;const jobs=(await res.json()).jobs||[],box=document.getElementById('jobs');box.replaceChildren();if(!jobs.length){const empty=document.createElement('span');empty.className='muted';empty.textContent='تسکی ثبت نشده است.';box.appendChild(empty);return}jobs.forEach(job=>{const button=document.createElement('button');button.type='button';button.className='jobrow';const name=document.createElement('span');name.textContent=job.original_name+' · '+(stageNames[job.stage]||job.stage)+' · '+job.progress+'٪';const state=document.createElement('strong');state.textContent=statusNames[job.status]||job.status;button.append(name,state);button.onclick=()=>selectJob(job.id);box.appendChild(button)})}
+function connectJob(jobId){currentJob=jobId;localStorage.setItem('translatorJobId',jobId);if(events)events.close();events=new EventSource('/api/jobs/'+jobId+'/events');events.addEventListener('progress',e=>{const job=JSON.parse(e.data);showState(job);if(terminal.includes(job.status)||job.status==='paused'){events.close();loadJobs()}});events.onerror=()=>{if(events)document.getElementById('message').textContent='ارتباط وضعیت موقتاً قطع شد؛ اتصال مجدد خودکار انجام می‌شود.'}}
+async function selectJob(jobId){const res=await fetch('/api/jobs/'+jobId);if(!res.ok){await loadJobs();return}const job=await res.json();showState(job);if(['queued','running','pausing'].includes(job.status))connectJob(jobId);else if(events){events.close();events=null}}
+async function jobAction(action,method='POST'){if(!currentJob)return;const res=await fetch('/api/jobs/'+currentJob+(action?'/'+action:''),{method,headers:{'X-CSRF-Token':csrfToken}});const data=await res.json();if(!res.ok){alert(data.error||'عملیات انجام نشد');return false}await selectJob(currentJob);await loadJobs();return true}
+form.onsubmit=async e=>{e.preventDefault();setText('formMessage','');document.getElementById('error').textContent='';const res=await fetch('/api/jobs',{method:'POST',body:new FormData(form)}),data=await res.json();if(!res.ok){setText('formMessage',data.error||'خطا در ثبت کار');return}await loadJobs();connectJob(data.job_id)};
+document.getElementById('pause').onclick=()=>jobAction('pause');document.getElementById('resume').onclick=async()=>{if(await jobAction('resume'))connectJob(currentJob)};document.getElementById('cancel').onclick=()=>jobAction('cancel');
+document.getElementById('delete').onclick=async()=>{if(confirm('این تسک، checkpoint و فایل‌هایش حذف شود؟')&&await jobAction('', 'DELETE')){if(events)events.close();localStorage.removeItem('translatorJobId');currentJob=null;document.getElementById('statusCard').classList.add('hidden');await loadJobs()}};
+document.getElementById('newTask').onclick=()=>{form.reset();document.querySelector('.switch button[data-type="text"]').click();document.getElementById('formCard').scrollIntoView({behavior:'smooth'});document.getElementById('text').focus()};
+document.getElementById('clearJobs').onclick=async()=>{if(!confirm('همهٔ تسک‌های متوقف، تمام‌شده، ناموفق و لغوشده حذف شوند؟'))return;const res=await fetch('/api/jobs/clear',{method:'POST',headers:{'X-CSRF-Token':csrfToken}});if(res.ok){const data=await res.json();setText('formMessage',data.deleted+' تسک حذف شد');await loadJobs()}};
+async function loadDoctor(){const res=await fetch('/api/doctor'),report=await res.json(),el=document.getElementById('runtimeHealth');const existing=Object.entries(report.models||{}).filter(([,value])=>value.exists).map(([key])=>key);el.textContent='آمادگی سیستم: '+(report.status==='ok'?'آماده':'ناقص')+' · Backend: '+report.backend+' · پروفایل: '+report.profile+' · مدل‌های موجود: '+(existing.join('، ')||'هیچ‌کدام');if(report.errors&&report.errors.length)el.title=report.errors.join('\n')}
+loadDoctor();loadJobs();const savedJob=localStorage.getItem('translatorJobId');if(savedJob)selectJob(savedJob);
 </script></body></html>"""
 
 
@@ -2797,10 +3228,22 @@ def create_app(config: dict[str, Any], start_worker: bool = True) -> Any:
     def index() -> Response:
         token = str(session.get("csrf_token") or secrets.token_urlsafe(32))
         session["csrf_token"] = token
-        return Response(
-            INDEX_HTML.replace("__CSRF_TOKEN__", html.escape(token, quote=True)),
+        response = Response(
+            INDEX_HTML.replace(
+                "__CSRF_TOKEN__", html.escape(token, quote=True)
+            ).replace("__APP_VERSION__", APP_VERSION),
             mimetype="text/html",
         )
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
+
+    @application.get("/assets/app-font")
+    def app_font() -> Any:
+        font_value = config.get("documents", {}).get("font_files", {}).get("fa")
+        font_path = Path(str(font_value or ""))
+        if not font_value or not font_path.is_file():
+            return Response(status=404)
+        return send_file(font_path, mimetype="font/ttf", max_age=3600)
 
     @application.get("/api/doctor")
     def doctor() -> Any:
@@ -2871,6 +3314,16 @@ def create_app(config: dict[str, Any], start_worker: bool = True) -> Any:
             runner.enqueue(job_id)
         return jsonify({"job_id": job_id}), 201
 
+    @application.get("/api/jobs")
+    def list_jobs() -> Any:
+        return jsonify({"jobs": store.list_jobs()})
+
+    @application.post("/api/jobs/clear")
+    def clear_jobs() -> Any:
+        if not csrf_is_valid():
+            return jsonify({"error": "درخواست امنیتی معتبر نیست."}), 403
+        return jsonify({"deleted": store.clear_deletable()})
+
     @application.get("/api/jobs/<job_id>")
     def job_status(job_id: str) -> Any:
         job = store.get(job_id)
@@ -2885,17 +3338,20 @@ def create_app(config: dict[str, Any], start_worker: bool = True) -> Any:
 
         def events() -> Iterable[str]:
             last_updated = None
+            last_sent = 0.0
             while True:
                 job = store.get(job_id)
                 if not job:
                     break
-                if job["updated_at"] != last_updated:
+                now = time.time()
+                if job["updated_at"] != last_updated or now - last_sent >= 2:
                     payload = json.dumps(store.public(job), ensure_ascii=False)
                     yield f"event: progress\ndata: {payload}\n\n"
                     last_updated = job["updated_at"]
+                    last_sent = now
                 else:
                     yield ": keep-alive\n\n"
-                if job["status"] in TERMINAL_JOB_STATES:
+                if job["status"] in STREAM_END_STATES:
                     break
                 time.sleep(0.5)
 
@@ -2913,6 +3369,39 @@ def create_app(config: dict[str, Any], start_worker: bool = True) -> Any:
         if not store.request_cancel(job_id):
             return jsonify({"error": "این کار قابل لغو نیست."}), 409
         return jsonify({"status": "cancelling"})
+
+    @application.post("/api/jobs/<job_id>/pause")
+    def pause_job(job_id: str) -> Any:
+        if not csrf_is_valid():
+            return jsonify({"error": "درخواست امنیتی معتبر نیست."}), 403
+        if not store.get(job_id):
+            return jsonify({"error": "کار پیدا نشد."}), 404
+        if not store.request_pause(job_id):
+            return jsonify({"error": "این کار قابل توقف نیست."}), 409
+        job = store.get(job_id)
+        return jsonify({"status": job["status"] if job else "pausing"})
+
+    @application.post("/api/jobs/<job_id>/resume")
+    def resume_job(job_id: str) -> Any:
+        if not csrf_is_valid():
+            return jsonify({"error": "درخواست امنیتی معتبر نیست."}), 403
+        if not store.get(job_id):
+            return jsonify({"error": "کار پیدا نشد."}), 404
+        if not store.resume(job_id):
+            return jsonify({"error": "این کار قابل ادامه نیست."}), 409
+        if runner is not None:
+            runner.enqueue(job_id)
+        return jsonify({"status": "queued"})
+
+    @application.delete("/api/jobs/<job_id>")
+    def delete_job(job_id: str) -> Any:
+        if not csrf_is_valid():
+            return jsonify({"error": "درخواست امنیتی معتبر نیست."}), 403
+        if not store.get(job_id):
+            return jsonify({"error": "کار پیدا نشد."}), 404
+        if not store.delete_job(job_id):
+            return jsonify({"error": "ابتدا کار در حال اجرا را متوقف کنید."}), 409
+        return jsonify({"status": "deleted"})
 
     @application.get("/api/jobs/<job_id>/download")
     def download_job(job_id: str) -> Any:
