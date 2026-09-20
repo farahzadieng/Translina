@@ -1,2 +1,5 @@
 .venv/
 translator_data/
+.DS_Store/
+.DS_Store
+translator.config.json
