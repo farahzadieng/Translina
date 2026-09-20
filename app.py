@@ -41,7 +41,7 @@ from urllib.parse import urlparse
 
 LANGUAGES = {"fa": "فارسی", "en": "English", "ar": "العربية"}
 RTL_LANGUAGES = {"fa", "ar"}
-APP_VERSION = "2.1.0-job-control"
+APP_VERSION = "2.2.0-balanced-quality"
 
 
 class TranslatorError(RuntimeError):
@@ -58,6 +58,10 @@ class JobPaused(TranslatorError):
 
 class ModelCapacityError(TranslatorError):
     """The rendered request cannot fit the model or available memory."""
+
+
+class ModelLoadError(TranslatorError):
+    """The configured model or llama.cpp backend could not be loaded."""
 
 
 class SegmentIntegrityError(TranslatorError):
@@ -614,12 +618,26 @@ def normalize_translation_segments(unit: TranslationUnit, value: Any) -> list[st
     return distribute_text(joined, unit.segments)
 
 
+_NUMBER_TRANSLATION = str.maketrans(
+    "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹−٬٫⁄：",
+    "01234567890123456789-,./:",
+)
+_NUMBER_PATTERN = re.compile(
+    r"(?<!\w)[+\-−]?(?:[0-9٠-٩۰-۹][0-9٠-٩۰-۹,٬.٫/⁄:：\-]*[0-9٠-٩۰-۹]|[0-9٠-٩۰-۹])(?!\w)"
+)
+
+
+def canonical_numbers(text: str) -> list[str]:
+    """Return comparable numbers while accepting localized Persian/Arabic digits."""
+    return [match.group(0).translate(_NUMBER_TRANSLATION) for match in _NUMBER_PATTERN.finditer(text)]
+
+
 def quality_flags(source: str, target: str) -> list[str]:
     flags: list[str] = []
     if not target.strip():
         return ["empty"]
-    source_numbers = re.findall(r"(?<!\w)[+-]?(?:\d[\d,./:-]*\d|\d)(?!\w)", source)
-    target_numbers = re.findall(r"(?<!\w)[+-]?(?:\d[\d,./:-]*\d|\d)(?!\w)", target)
+    source_numbers = canonical_numbers(source)
+    target_numbers = canonical_numbers(target)
     if sorted(source_numbers) != sorted(target_numbers):
         flags.append("numbers")
     source_urls = re.findall(r"https?://[^\s<>()]+", source)
@@ -645,6 +663,10 @@ def glossary_flags(source: str, target: str, analysis: dict[str, Any]) -> list[s
         return flags
     for term in terms:
         if not isinstance(term, dict):
+            continue
+        # Terms inferred by a small model are useful guidance, not ground truth.
+        # Only an explicitly user-locked glossary entry may block delivery.
+        if term.get("locked") is not True:
             continue
         source_term = str(term.get("source", "")).strip()
         target_term = str(term.get("target", "")).strip()
@@ -687,17 +709,17 @@ class ModelManager:
                 from llama_cpp import Llama
             except ImportError as exc:
                 self._notify("error", model_key)
-                raise TranslatorError(
+                raise ModelLoadError(
                     "llama-cpp-python is not installed. Run 'pip install llama-cpp-python'."
                 ) from exc
             model_config = self.config.get("models", {}).get(model_key)
             if not model_config:
                 self._notify("error", model_key)
-                raise TranslatorError(f"Model '{model_key}' is not configured.")
+                raise ModelLoadError(f"Model '{model_key}' is not configured.")
             model_path = Path(str(model_config.get("path", "")))
             if not model_path.is_file():
                 self._notify("error", model_key)
-                raise TranslatorError(f"Model file not found: {model_path}")
+                raise ModelLoadError(f"Model file not found: {model_path}")
             runtime = self.config.get("runtime", {})
             threads_value = runtime.get("threads", "auto")
             threads = (
@@ -726,7 +748,7 @@ class ModelManager:
                 self._model = Llama(**kwargs)
             except Exception as exc:
                 self._notify("error", model_key)
-                raise TranslatorError(
+                raise ModelLoadError(
                     f"Could not load model '{model_key}': {exc}"
                 ) from exc
             self._model_key = model_key
@@ -841,6 +863,7 @@ class TranslationPipeline:
         self.paused = paused or (lambda: False)
         self.checkpoint = checkpoint or (lambda *args, **kwargs: None)
         self.options = config.get("translation", {})
+        self.quality_warnings: dict[str, list[str]] = {}
 
     def _check_cancelled(self) -> None:
         if self.cancelled():
@@ -907,7 +930,9 @@ class TranslationPipeline:
         safety = int(self.options.get("context_safety_tokens", 512))
         fixed_analysis_prompt = (
             "You are a senior translation analyst. Return JSON with keys domain, audience, summary, "
-            "style, and terms. terms is an array of objects with source and target. Do not translate the document."
+            "style, and terms. terms is an array of recurring multiword concepts with source, target, and "
+            "locked=false. Prefer an empty terms list over a speculative or literal term. Do not translate "
+            "the document."
         )
         fixed_tokens = self.models.count_tokens(model_key, fixed_analysis_prompt) + 128
         sample_budget = max(64, context_size - reserved - safety - fixed_tokens)
@@ -988,7 +1013,9 @@ class TranslationPipeline:
             "You are an elite professional translator. Transfer every meaning accurately, then write as a native "
             "author in the target language. Never translate literally when native syntax requires restructuring. "
             "Do not add, omit, explain, censor, or summarize. Preserve numbers, URLs, names, negation, ambiguity, "
-            "and formatting boundaries. Segments are formatting boundaries inside complete paragraphs: use the full "
+            "and formatting boundaries. Reuse one accurate target expression for every recurring source concept; "
+            "treat multiword species names, idioms, titles, and technical terms as indivisible concepts and never "
+            "replace their head noun with a different object or species. Segments are formatting boundaries inside complete paragraphs: use the full "
             "paragraph as context, and return exactly the same number of segments for every id. Return JSON only."
         )
         try:
@@ -1045,13 +1072,14 @@ class TranslationPipeline:
                     )
                     for unit in batch
                 }
-            except SegmentIntegrityError:
+            except TranslatorError:
                 if attempt >= integrity_retries:
                     raise
                 correction = dict(payload)
                 correction["correction"] = (
-                    "Your previous response changed protected formatting boundaries. "
-                    "Return exactly one output string for every input segment and keep protected indices separate."
+                    "Your previous response omitted an id, returned empty text, or changed formatting boundaries. "
+                    "Return a non-empty translation for every id, with exactly one output string per input segment, "
+                    "and keep protected indices separate."
                 )
                 data = self._json_call(
                     model_key,
@@ -1154,7 +1182,9 @@ class TranslationPipeline:
             "You are a bilingual senior editor and fidelity checker. Compare source and draft, then return a final, "
             "publication-ready target-language version. Improve native syntax, rhetoric, terminology, dialogue voice, "
             "and flow as appropriate, while preserving every fact, number, URL, name, negation, intensity, and intended "
-            'ambiguity. Return JSON {"translations": {id: [segments]}} with exactly the original segment counts.'
+            "ambiguity. Enforce one semantically accurate translation for every recurring multiword concept; never "
+            'change an animal, object, person, or technical concept into another. Return JSON {"translations": {id: [segments]}} '
+            "with exactly the original segment counts."
         )
         try:
             data = self._json_call(
@@ -1371,6 +1401,9 @@ class TranslationPipeline:
         if not nonempty:
             return {unit.unit_id: list(unit.segments) for unit in units}
         state = resume if isinstance(resume, dict) else {}
+        quality_mode = str(self.options.get("quality_mode", "balanced")).lower()
+        if quality_mode not in {"fast", "balanced", "strict"}:
+            quality_mode = "balanced"
         translator_key = self.profile["translator"]
         reviewer_key = self.profile.get("reviewer", translator_key)
         self.progress("analysis", 5, "در حال تحلیل موضوع، مخاطب و لحن سند")
@@ -1496,22 +1529,29 @@ class TranslationPipeline:
             )
 
         fidelity: dict[str, list[str]] = {}
-        for index, batch in enumerate(edit_batches):
-            self._check_cancelled()
-            fidelity.update(
-                self._fidelity_batch(
-                    reviewer_key,
-                    batch,
-                    finals,
-                    source_language,
-                    target_language,
-                    analysis,
+        if quality_mode == "strict":
+            for index, batch in enumerate(edit_batches):
+                self._check_cancelled()
+                fidelity.update(
+                    self._fidelity_batch(
+                        reviewer_key,
+                        batch,
+                        finals,
+                        source_language,
+                        target_language,
+                        analysis,
+                    )
                 )
-            )
+                self.progress(
+                    "quality",
+                    80 + int(7 * (index + 1) / max(1, len(edit_batches))),
+                    f"داوری وفاداری: بخش {index + 1} از {len(edit_batches)}",
+                )
+        else:
             self.progress(
                 "quality",
-                80 + int(7 * (index + 1) / max(1, len(edit_batches))),
-                f"داوری وفاداری: بخش {index + 1} از {len(edit_batches)}",
+                87,
+                "کنترل سریع اعداد، پیوندها، ایمیل و یکپارچگی خروجی",
             )
 
         def collect_issues(
@@ -1531,7 +1571,14 @@ class TranslationPipeline:
 
         units_by_id = {unit.unit_id: unit for unit in working_units}
         unresolved = collect_issues(working_units)
-        repair_attempts = max(1, int(self.options.get("quality_repair_attempts", 2)))
+        configured_repairs = max(
+            0, int(self.options.get("quality_repair_attempts", 2))
+        )
+        repair_attempts = (
+            configured_repairs
+            if quality_mode == "strict"
+            else min(1, configured_repairs)
+        )
         for attempt in range(repair_attempts):
             if not unresolved:
                 break
@@ -1553,14 +1600,17 @@ class TranslationPipeline:
                     87 + int(3 * (index + 1) / max(1, len(unresolved))),
                     f"اصلاح کیفیت: تلاش {attempt + 1}، مورد {index + 1} از {len(unresolved)}",
                 )
-            fidelity = self._fidelity_batch(
-                reviewer_key,
-                repaired_units,
-                finals,
-                source_language,
-                target_language,
-                analysis,
-            )
+            if quality_mode == "strict":
+                fidelity = self._fidelity_batch(
+                    reviewer_key,
+                    repaired_units,
+                    finals,
+                    source_language,
+                    target_language,
+                    analysis,
+                )
+            else:
+                fidelity = {}
             unresolved = collect_issues(repaired_units)
             self.checkpoint(
                 "quality_repair",
@@ -1571,7 +1621,10 @@ class TranslationPipeline:
                     "finals": finals,
                 },
             )
-        if unresolved:
+        self.quality_warnings = unresolved
+        if unresolved and quality_mode == "strict" and not bool(
+            self.options.get("allow_output_with_warnings", False)
+        ):
             details = "; ".join(
                 f"{unit_id}: {', '.join(flags[:3])}"
                 for unit_id, flags in list(unresolved.items())[:5]
@@ -1586,9 +1639,18 @@ class TranslationPipeline:
                 "manifest": manifest,
                 "drafts": drafts,
                 "finals": finals,
+                "quality_warnings": self.quality_warnings,
             },
         )
-        self.progress("quality", 90, "کنترل وفاداری و یکپارچگی تکمیل شد")
+        if self.quality_warnings:
+            warning_count = sum(len(items) for items in self.quality_warnings.values())
+            self.progress(
+                "quality",
+                90,
+                f"کنترل کیفیت تکمیل شد؛ خروجی با {warning_count} هشدار قابل دانلود خواهد بود",
+            )
+        else:
+            self.progress("quality", 90, "کنترل وفاداری و یکپارچگی تکمیل شد")
         self.models.unload()
         reassembled = reassemble_split_units(
             nonempty, working_units, split_mapping, finals
@@ -2618,9 +2680,14 @@ class JobStore:
 
     def resume(self, job_id: str) -> bool:
         job = self.get(job_id)
-        if not job or job["status"] != "paused":
+        if not job or job["status"] not in {"paused", "failed"}:
             return False
-        stage = str(job.get("paused_from_stage") or job.get("stage") or "queued")
+        failed_retry = job["status"] == "failed"
+        stage = (
+            "checkpoint"
+            if failed_retry
+            else str(job.get("paused_from_stage") or job.get("stage") or "queued")
+        )
         self.update(
             job_id,
             status="queued",
@@ -2628,7 +2695,12 @@ class JobStore:
             pause_requested=0,
             cancel_requested=0,
             error="",
-            message=f"در صف ادامه از مرحلهٔ {stage}",
+            model_state="unloaded",
+            message=(
+                "در صف تلاش دوباره از آخرین checkpoint"
+                if failed_retry
+                else f"در صف ادامه از مرحلهٔ {stage}"
+            ),
         )
         return True
 
@@ -2916,7 +2988,7 @@ class JobRunner:
                 )
             except (JobCancelled, JobPaused):
                 raise
-            except TranslatorError:
+            except ModelLoadError:
                 if profile_name != "high":
                     raise
                 low = copy.deepcopy(self.config.get("profiles", {}).get("low", {}))
@@ -2963,12 +3035,21 @@ class JobRunner:
                 raise TranslatorError(
                     "Output validation failed: the generated file is empty."
                 )
+            warning_count = sum(
+                len(items)
+                for items in getattr(pipeline, "quality_warnings", {}).values()
+            )
+            completion_message = (
+                f"ترجمه آماده دانلود است؛ {warning_count} هشدار کنترل کیفیت ثبت شد"
+                if warning_count
+                else "ترجمه آماده دانلود است"
+            )
             self.store.update(
                 job_id,
                 status="completed",
                 stage="completed",
                 progress=100,
-                message="ترجمه آماده دانلود است",
+                message=completion_message,
                 output_path=str(output_path),
                 output_name=filename,
                 error="",
@@ -3139,7 +3220,7 @@ INDEX_HTML = r"""<!doctype html>
 const form=document.getElementById('jobForm'),inputType=document.getElementById('inputType'),textInput=document.getElementById('textInput'),fileInput=document.getElementById('fileInput'),csrfToken=document.querySelector('meta[name="csrf-token"]').content;
 let currentJob=null,events=null;
 const terminal=['completed','failed','cancelled'];
-const stageNames={queued:'در صف',preparing:'آماده‌سازی',structure:'استخراج ساختار',loading_model:'بارگذاری مدل',model_error:'خطای مدل',analysis:'تحلیل متن',manifest:'ثبت checkpoint',translation:'ترجمهٔ اولیه',draft:'ترجمهٔ اولیه',context:'به‌روزرسانی حافظه',editing:'ویرایش',quality:'کنترل کیفیت',quality_repair:'اصلاح کیفیت',fallback:'مدل جایگزین',rebuilding:'ساخت خروجی',completed:'تکمیل‌شده',paused:'متوقف',failed:'خطا',cancelled:'لغوشده'};
+const stageNames={queued:'در صف',checkpoint:'ادامه از checkpoint',preparing:'آماده‌سازی',structure:'استخراج ساختار',loading_model:'بارگذاری مدل',model_error:'خطای مدل',analysis:'تحلیل متن',manifest:'ثبت checkpoint',translation:'ترجمهٔ اولیه',draft:'ترجمهٔ اولیه',context:'به‌روزرسانی حافظه',editing:'ویرایش',quality:'کنترل کیفیت',quality_repair:'اصلاح کیفیت',fallback:'مدل جایگزین',rebuilding:'ساخت خروجی',completed:'تکمیل‌شده',paused:'متوقف',failed:'خطا',cancelled:'لغوشده'};
 const statusNames={queued:'در صف',running:'در حال اجرا',pausing:'در انتظار توقف امن',paused:'متوقف',completed:'تکمیل‌شده',failed:'ناموفق',cancelled:'لغوشده'};
 const modelNames={not_loaded:'هنوز بارگذاری نشده',loading:'در حال بارگذاری',loaded:'بارگذاری شده',unloaded:'از حافظه خارج شده',error:'خطای بارگذاری'};
 document.querySelectorAll('.switch button').forEach(btn=>btn.onclick=()=>{document.querySelectorAll('.switch button').forEach(x=>x.classList.remove('active'));btn.classList.add('active');inputType.value=btn.dataset.type;const isText=btn.dataset.type==='text';textInput.classList.toggle('hidden',!isText);fileInput.classList.toggle('hidden',isText);document.getElementById('file').accept=btn.dataset.type==='docx'?'.docx':btn.dataset.type==='pdf'?'.pdf':'';});
@@ -3154,9 +3235,10 @@ function showState(job){
   else if(job.health_state==='working'){health.textContent='سلامت اجرا: Worker پاسخگو است و پردازش ادامه دارد.'}
   else if(job.status==='paused'){health.textContent='سلامت اجرا: تسک عمداً متوقف است و مدل از حافظه خارج می‌شود.'}
   else if(job.status==='queued'){health.textContent='سلامت اجرا: تسک در صف است و هنوز مدل را اشغال نکرده.'}
+  else if(job.status==='failed'){health.textContent='سلامت اجرا: این تسک متوقف شده و اکنون هیچ پردازشی برای آن در حال اجرا نیست.';health.classList.add('bad')}
   else{health.textContent='سلامت اجرا: '+(statusNames[job.status]||job.status)}
-  const done=job.status==='completed',paused=job.status==='paused',active=['queued','running','pausing'].includes(job.status),deletable=paused||terminal.includes(job.status);
-  document.getElementById('download').classList.toggle('hidden',!done);document.getElementById('pause').classList.toggle('hidden',!['queued','running'].includes(job.status));document.getElementById('resume').classList.toggle('hidden',!paused);document.getElementById('cancel').classList.toggle('hidden',!active&&!paused);document.getElementById('delete').classList.toggle('hidden',!deletable);if(done)document.getElementById('download').href='/api/jobs/'+job.id+'/download';
+  const done=job.status==='completed',paused=job.status==='paused',retryable=paused||job.status==='failed',active=['queued','running','pausing'].includes(job.status),deletable=paused||terminal.includes(job.status),resume=document.getElementById('resume');
+  document.getElementById('download').classList.toggle('hidden',!done);document.getElementById('pause').classList.toggle('hidden',!['queued','running'].includes(job.status));resume.classList.toggle('hidden',!retryable);resume.textContent=job.status==='failed'?'تلاش دوباره از checkpoint':'ادامه';document.getElementById('cancel').classList.toggle('hidden',!active&&!paused);document.getElementById('delete').classList.toggle('hidden',!deletable);if(done)document.getElementById('download').href='/api/jobs/'+job.id+'/download';
   const history=document.getElementById('history');history.replaceChildren();(job.history||[]).slice(-12).reverse().forEach(item=>{const li=document.createElement('li');li.textContent=(stageNames[item.stage]||item.stage)+' — '+item.progress+'٪ — '+item.message;history.appendChild(li)});
 }
 async function loadJobs(){const res=await fetch('/api/jobs');if(!res.ok)return;const jobs=(await res.json()).jobs||[],box=document.getElementById('jobs');box.replaceChildren();if(!jobs.length){const empty=document.createElement('span');empty.className='muted';empty.textContent='تسکی ثبت نشده است.';box.appendChild(empty);return}jobs.forEach(job=>{const button=document.createElement('button');button.type='button';button.className='jobrow';const name=document.createElement('span');name.textContent=job.original_name+' · '+(stageNames[job.stage]||job.stage)+' · '+job.progress+'٪';const state=document.createElement('strong');state.textContent=statusNames[job.status]||job.status;button.append(name,state);button.onclick=()=>selectJob(job.id);box.appendChild(button)})}
