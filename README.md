@@ -1,349 +1,426 @@
-<div align="center">
+::: {align="center"}
 
 # Translina
 
 **Local models. Local documents. Private translation.**
 
-`Farsi` · `Arabic` · `English`
+`Persian` · `Arabic` · `English`
+:::
 
-</div>
+## About
 
-# About
+**Translina** is a local-first document translation web app.
 
-> **Private, local document translation powered by local LLMs.**
+It translates:
 
-**Translina** is a local-first translation application for translating **Microsoft Word documents (`.docx`)**, **digital PDFs**, and **plain text** between:
+- plain text
+- Microsoft Word (`.docx`)
+- digital PDF files with a text layer
 
-- 🇮🇷 **Farsi / Persian**
-- 🇸🇦 **Arabic**
-- 🇬🇧 **English**
+All translation runs locally. No cloud translation API is required.
 
-Translina runs translation models **locally on your machine**, keeping documents and text private without requiring a cloud translation service.
-
-The translation pipeline uses multiple stages of translation, editing, and verification to improve **accuracy, fluency, terminology consistency, and preservation of meaning**.
-
----
-
-## ✨ Features
-
-- 🔒 **Local & private** — documents are processed on your machine
-- 🌐 **Farsi, Arabic, and English**
-- 📄 **DOCX translation**
-- 📕 **Digital PDF translation**
-- 📝 **Plain-text translation**
-- 🧠 Powered by local **GGUF LLMs**
-- ✅ Multi-stage translation verification
-- 🎯 Configurable translation tone
-- 🔄 Translation progress tracking
-- ⛔ Translation cancellation
-- 💾 Checkpoint-based processing
-- ↔️ Automatic **RTL / LTR** handling
-- 🖥️ macOS Apple Silicon and Windows support
-- 🚫 No cloud translation API required
-
----
-
-## 🧠 Translation Pipeline
-
-Translina does more than send a piece of text to an LLM and return the result.
-
-Documents pass through a structured translation pipeline:
+The current pipeline uses three specialized local models instead of
+asking one LLM to do everything:
 
 ```text
 Document
-   │
-   ▼
-Structural Analysis
-   │
-   ▼
-Document & Context Analysis
-   │
-   ▼
-Glossary / Translation Memory
-   │
-   ▼
-Initial Translation
-   │
-   ▼
-Target-Language Editing
-   │
-   ▼
-Fidelity Verification
-   │
-   ▼
-Consistency Verification
-   │
-   ▼
-Document Reconstruction
-   │
-   ▼
-Translated Document
-```
-
-### Three quality layers
-
-After the initial translation, Translina uses multiple verification stages.
-
-**1. Language Editing**
-
-Improves sentence structure, readability, fluency, and target-language style without intentionally changing the original meaning.
-
-**2. Fidelity Verification**
-
-Checks important translation details such as:
-
-- meaning
-- numbers
-- names
-- dates
-- negation
-- terminology
-- missing information
-- unintended additions
-
-**3. Consistency Verification**
-
-Checks the complete document for consistent:
-
-- terminology
-- tone
-- names
-- punctuation
-- translation decisions
-- RTL / LTR direction
-
-Suspicious sections can be corrected independently instead of translating the entire document again.
-
----
-
-## 🤖 Models
-
-Translina is designed around the following local GGUF models:
-
-```text
-Qwen2.5-14B-Instruct
-Gemma 3 12B Instruct
-Gemma 3 4B Instruct
-```
-
-For example:
-
-```text
-Qwen2.5-14B-Instruct-Q4_K_M.gguf
-google_gemma-3-12b-it-Q4_K_M.gguf
-google_gemma-3-4b-it-Q4_K_M.gguf
-```
-
-### Recommended model profiles
-
-#### 16 GB RAM
-
-```text
-Qwen 2.5 14B
-    ↓
-Document analysis
-Glossary extraction
-Initial translation
-
+   ↓
 Gemma 3 12B
-    ↓
-Target-language editing
-Quality verification
+Context / terminology analysis
+   ↓
+MADLAD-400 7B MT-BT
+Initial machine translation
+   ↓
+Gemma 3 12B
+Semantic post-editing
+   ↓
+Deterministic QA
+   ↓
+Dorna Llama 3 8B
+Persian-language polishing
+   ↓
+Final QA
+   ↓
+TXT / DOCX / PDF
 ```
 
-The models are loaded sequentially so memory can be released before the next model is loaded.
+Models are loaded sequentially so large models do not need to stay in
+memory together.
 
-#### 8 GB RAM
+## Features
 
-```text
-Gemma 3 4B
-    ↓
-Analysis
-Translation
-Editing
-Verification
-```
+- Fully local translation
+- Persian, Arabic, and English
+- TXT, DOCX, and digital PDF input
+- DOCX structure/style preservation
+- RTL/LTR handling
+- Translation glossary
+- Translation memory
+- Number, URL, email, and terminology checks
+- Job progress tracking
+- Pause, resume, and cancel
+- Checkpoint-based recovery
+- Local job history
+- Configurable translation tone
+- Apple Silicon Metal acceleration for GGUF LLMs
+- NVIDIA CUDA support for GGUF LLMs when `llama-cpp-python` is built
+  with CUDA
+- No Ollama dependency
 
-The 4B model performs the different pipeline roles in separate passes and is the recommended low-memory configuration.
+## Models
+
+Translina currently expects:
+
+Role Model Backend
 
 ---
 
-# 🚀 Setup
+Initial translation MADLAD-400 7B MT-BT CTranslate2
+Analysis + semantic review Gemma 3 12B Instruct Q4_K_M llama.cpp
+Persian polishing Dorna Llama 3 8B Instruct Q5_K_M llama.cpp
+
+Recommended model layout:
+
+```text
+Ai-Models/
+├── madlad/
+│   ├── model.bin
+│   ├── config.json
+│   ├── shared_vocabulary.json
+│   ├── spiece.model
+│   └── ...
+├── gemma/
+│   └── google_gemma-3-12b-it-Q4_K_M.gguf
+└── dorna/
+    └── dorna-llama3-8b-instruct.Q5_K_M.gguf
+```
+
+> Models are not included in this repository. Do not commit large
+> GGUF/model files to Git.
 
 ## Requirements
 
 Recommended:
 
-- **Python 3.12**
-- `llama-cpp-python`
-- Flask
-- lxml
-- python-docx
-- PyMuPDF
-- Local GGUF models
+- Python 3.12
+- 16 GB RAM or more
+- about 25 GB free disk space for the recommended models
+- modern Apple Silicon Mac or NVIDIA GPU recommended
 
-You will need local copies of the required models before starting Translina.
+Python packages are listed in:
 
-Add the model locations to:
+```text
+requirements.txt
+```
+
+## 1. Get the models
+
+Create a model directory outside the Git repository.
+
+Example:
+
+```text
+~/Ai-Models
+```
+
+### MADLAD
+
+Translina expects a **CTranslate2-converted** MADLAD-400 7B MT-BT model.
+
+The configured path must point to the **model directory**, not to
+`model.bin`.
+
+Example:
+
+```text
+/Users/you/Ai-Models/madlad
+```
+
+### Gemma
+
+Expected GGUF:
+
+```text
+google_gemma-3-12b-it-Q4_K_M.gguf
+```
+
+### Dorna
+
+Expected GGUF:
+
+```text
+dorna-llama3-8b-instruct.Q5_K_M.gguf
+```
+
+Dorna may require accepting its Hugging Face access conditions before
+downloading.
+
+## 2. Configure model paths
+
+Open:
 
 ```text
 translator.config.json
 ```
 
----
+Set:
 
-# 🍎 macOS — Apple Silicon
+```json
+{
+  "paths": {
+    "model_root": "/absolute/path/to/Ai-Models",
+    "data_dir": "./translator_data"
+  }
+}
+```
 
-Translina can use the **Metal** backend through `llama.cpp` on Apple Silicon.
+Model entries should point to:
 
-## 1. Create a virtual environment
+```text
+${MODEL_ROOT}/madlad
+${MODEL_ROOT}/gemma/google_gemma-3-12b-it-Q4_K_M.gguf
+${MODEL_ROOT}/dorna/dorna-llama3-8b-instruct.Q5_K_M.gguf
+```
+
+Use forward slashes in JSON paths on Windows if possible:
+
+```text
+D:/AI/Ai-Models
+```
+
+## macOS --- Apple Silicon
+
+Gemma and Dorna can use **Metal** through `llama.cpp`.
+
+MADLAD uses CTranslate2 and currently runs on CPU on macOS.
+
+### 1. Create the environment
 
 ```bash
 python3.12 -m venv .venv
-```
-
-## 2. Activate it
-
-```bash
 source .venv/bin/activate
-```
-
-## 3. Upgrade pip
-
-```bash
 python -m pip install --upgrade pip
 ```
 
-## 4. Install dependencies
+### 2. Install normal dependencies
 
 ```bash
-python -m pip install Flask lxml python-docx PyMuPDF
+python -m pip install -r requirements.txt
 ```
 
-## 5. Install `llama-cpp-python` with Metal support
+### 3. Install `llama-cpp-python` with Metal
+
+If the project includes `install_mac.sh`, the easiest option is:
 
 ```bash
-python -m pip install llama-cpp-python \
-  --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/metal
+chmod +x install_mac.sh
+./install_mac.sh
 ```
 
----
+Otherwise build/install `llama-cpp-python` with Metal enabled:
 
-## 🔍 Check the installation
+```bash
+CMAKE_ARGS="-DGGML_METAL=on" \
+python -m pip install --upgrade --force-reinstall llama-cpp-python --no-cache-dir
+```
 
-Before starting the application, run the built-in diagnostic and model probe:
+### 4. Verify Metal
+
+```bash
+python -c "from llama_cpp import llama_cpp; print(llama_cpp.llama_supports_gpu_offload())"
+```
+
+Expected:
+
+```text
+True
+```
+
+### 5. Run diagnostics
 
 ```bash
 python app.py --config translator.config.json --doctor --probe-model
 ```
 
-This can be used to verify the application environment and model configuration before starting the server.
+A healthy setup should report:
 
----
+```text
+status: ok
+backend: ctranslate2+llama.cpp(metal)
+llm_acceleration: metal
+probe.ok: true
+errors: []
+```
 
-## ▶️ Run Translina
+### 6. Start Translina
 
 ```bash
 python app.py --config translator.config.json
 ```
 
-Then open:
+Open:
 
 ```text
 http://127.0.0.1:5000
 ```
 
----
+## Windows
 
-# 🪟 Windows
+On Windows, Gemma and Dorna can run through either CPU or an NVIDIA GPU.
 
-## 1. Create a virtual environment
+For an NVIDIA GPU, install a CUDA-enabled build of `llama-cpp-python`.
+MADLAD can also use the CTranslate2 CUDA backend when the required
+NVIDIA/CUDA runtime is available.
+
+### 1. Create the environment
 
 ```powershell
 py -3.12 -m venv .venv
-```
-
-## 2. Activate it
-
-```powershell
 .venv\Scripts\Activate.ps1
-```
-
-## 3. Upgrade pip
-
-```powershell
 python -m pip install --upgrade pip
 ```
 
-## 4. Install dependencies
+### 2. Install dependencies
 
 ```powershell
-python -m pip install Flask lxml python-docx PyMuPDF llama-cpp-python
+python -m pip install -r requirements.txt
 ```
 
-## 5. Check the installation
+### 3. Install `llama-cpp-python`
+
+For CPU-only testing:
+
+```powershell
+python -m pip install llama-cpp-python
+```
+
+For NVIDIA/CUDA, install or build `llama-cpp-python` with CUDA support
+for your local CUDA environment.
+
+Example source build:
+
+```powershell
+$env:CMAKE_ARGS="-DGGML_CUDA=on"
+python -m pip install --upgrade --force-reinstall llama-cpp-python --no-cache-dir
+```
+
+### 4. Configure MADLAD
+
+For CPU:
+
+```json
+"device": "cpu",
+"compute_type": "int8"
+```
+
+For a supported NVIDIA/CUDA setup:
+
+```json
+"device": "cuda",
+"compute_type": "int8_float16"
+```
+
+The included `auto` profile can choose the appropriate configured
+profile, but always confirm it with `--doctor`.
+
+### 5. Run diagnostics
 
 ```powershell
 python app.py --config translator.config.json --doctor --probe-model
 ```
 
-## 6. Run Translina
+Do not continue until:
+
+```text
+probe.ok: true
+errors: []
+```
+
+### 6. Start Translina
 
 ```powershell
 python app.py --config translator.config.json
 ```
 
-Then open:
+Open:
 
 ```text
 http://127.0.0.1:5000
 ```
 
----
+## Using `uv`
 
-# ⚙️ Configuration
+`uv` is optional.
 
-Translina reads its configuration from:
+If the project environment is already active:
 
-```text
-translator.config.json
+```bash
+uv run --active app.py --config translator.config.json --doctor --probe-model
 ```
 
-The configuration is used to define settings such as:
+Run the server:
 
-- model locations
-- model roles
-- inference backend
-- context settings
-- GPU layer settings
-- application data paths
-- fallback fonts
-- optional LibreOffice location
+```bash
+uv run --active app.py --config translator.config.json
+```
 
-Model paths can be configured according to the machine running Translina.
+If `uv` warns that `VIRTUAL_ENV` points to a different project, either
+activate the correct `.venv` or omit `--active` and let `uv` use the
+project environment.
 
-> Keep model files outside the Git repository. GGUF models are large and should not normally be committed to source control.
+## Diagnostics
+
+Always run this first when moving the project to another computer:
+
+```bash
+python app.py --config translator.config.json --doctor --probe-model
+```
+
+It checks:
+
+- Python dependencies
+- model paths
+- CTranslate2
+- llama.cpp
+- Metal/CUDA availability
+- MADLAD translation
+- Gemma generation
+- Dorna generation
+
+A successful probe is the best indication that the local model stack is
+ready.
+
+## Usage
+
+```text
+1. Start Translina
+2. Open http://127.0.0.1:5000
+3. Paste text or upload DOCX/PDF
+4. Choose source language
+5. Choose target language
+6. Select a tone
+7. Add glossary terms if needed
+8. Start translation
+9. Watch progress
+10. Download the result
+```
+
+## Supported files
+
+Input Support Notes
 
 ---
 
-# 📄 Supported Inputs
+Plain text ✅ Preserves paragraphs
+DOCX ✅ Attempts to preserve structure and formatting
+Digital PDF ✅ Requires a text layer
+Scanned PDF ❌ OCR is not included
+PPTX ❌ Not currently supported
+XLSX ❌ Not currently supported
 
-| Input                  | Supported | Notes                                              |
-| ---------------------- | :-------: | -------------------------------------------------- |
-| Plain text             |    ✅     | Preserves paragraphs and blank lines               |
-| Microsoft Word `.docx` |    ✅     | Attempts to preserve document structure and styles |
-| Digital PDF            |    ✅     | PDF must contain a text layer                      |
-| Scanned PDF            |    ❌     | OCR is not currently included                      |
-| PowerPoint             |    ❌     | Not currently supported                            |
-| Excel                  |    ❌     | Not currently supported                            |
+## DOCX
 
----
-
-# 📝 DOCX Translation
-
-Translina translates complete semantic units rather than independently translating every Word formatting run.
-
-The document engine is designed to preserve as much of the original structure as possible, including:
+Translina attempts to preserve:
 
 - paragraphs
 - headings
@@ -351,45 +428,37 @@ The document engine is designed to preserve as much of the original structure as
 - tables
 - headers and footers
 - hyperlinks
-- bold and italic text
-- page and section breaks
-- document direction
+- bold/italic formatting
+- section/page breaks
+- RTL/LTR direction
 
-For Persian and Arabic output, document direction can be changed to **RTL**.
+Exact pagination may change after translation.
 
-English output uses **LTR**.
+## PDF
 
-Because translated text may be shorter or longer than the original, exact pixel-perfect pagination is not guaranteed.
+Only digital PDFs with extractable text are supported.
 
----
+The output may reflow. The goal is readable translated layout, not
+pixel-perfect reproduction of the original PDF.
 
-# 📕 PDF Translation
+## Translation modes
 
-Translina supports **digital PDFs containing a text layer**.
+The application supports quality profiles such as:
 
-The PDF pipeline analyzes elements such as:
+```text
+fast
+balanced
+strict
+```
 
-- text blocks
-- fonts
-- colors
-- images
-- margins
-- headings
-- repeated document elements
+`balanced` is the normal default.
 
-The translated PDF may use **reflow**, meaning the number of pages can change depending on the translated text.
+Higher-quality modes perform more review/polishing work and therefore
+take longer.
 
-The goal is to preserve the overall visual hierarchy and readability rather than reproduce the source PDF pixel-for-pixel.
+## Tone
 
-> **Scanned PDFs and OCR are not currently supported.**
-
----
-
-# 🎭 Translation Tone
-
-Translations can be adapted for different styles of writing.
-
-Supported tone profiles include:
+Available tone choices include:
 
 ```text
 Automatic
@@ -402,219 +471,208 @@ Conversational
 Screenplay
 ```
 
-An optional custom description can also be used to provide additional context about the intended audience or writing style.
+A custom style/context description can also be supplied.
 
----
+## Privacy
 
-# 🌍 Language Direction
-
-Translina handles both right-to-left and left-to-right languages.
-
-```text
-Farsi   → RTL
-Arabic  → RTL
-English → LTR
-```
-
-Direction-sensitive document elements are adjusted when producing translated output.
-
----
-
-# 🔐 Privacy
-
-Translina is designed to operate locally.
-
-By default:
-
-```text
-Your document
-     │
-     ▼
-Your machine
-     │
-     ▼
-Local LLM
-     │
-     ▼
-Translated document
-```
-
-Your document does **not need to be uploaded to a cloud translation provider**.
-
-The application listens on the local loopback interface by default:
+By default, Translina listens only on:
 
 ```text
 127.0.0.1
 ```
 
-This makes Translina suitable for documents where privacy or confidentiality is important.
+Documents, extracted text, model prompts, and translation output can
+remain on the local machine.
 
----
+No cloud translation API is required.
 
-# 🏗️ Architecture
+## Project structure
 
-At a high level, Translina consists of:
-
-```text
-┌──────────────────────────┐
-│       Flask UI/API       │
-└────────────┬─────────────┘
-             │
-┌────────────▼─────────────┐
-│       Job Manager        │
-└────────────┬─────────────┘
-             │
-    ┌────────▼────────┐
-    │ Document Engine │
-    └────────┬────────┘
-             │
-┌────────────▼─────────────┐
-│   Translation Pipeline   │
-└────────────┬─────────────┘
-             │
-     ┌───────▼────────┐
-     │ Context Manager│
-     └───────┬────────┘
-             │
-      ┌──────▼───────┐
-      │ Model Manager │
-      │ llama.cpp     │
-      └──────┬───────┘
-             │
-   ┌─────────▼──────────┐
-   │ Quality Controller │
-   └─────────┬──────────┘
-             │
-   ┌─────────▼──────────┐
-   │ Output Validation  │
-   └────────────────────┘
-```
-
-The application uses `llama.cpp` through `llama-cpp-python` for local GGUF model inference.
-
----
-
-# 💾 Long Documents
-
-Long documents are split using natural boundaries such as:
-
-- sentences
-- paragraphs
-- sections
-- scenes
-- dialogue boundaries
-
-Translina maintains contextual information including:
+A typical installation looks like:
 
 ```text
-Document summary
-Section summary
-Glossary
-Names
-Translation decisions
-Nearby context
-Current text
+Translina/
+├── app.py
+├── translator.config.json
+├── requirements.txt
+├── install_mac.sh
+├── font/
+└── translator_data/
 ```
 
-This helps maintain terminology and translation consistency across larger documents while remaining within the model's context window.
+Runtime data is stored under `translator_data/`, including job state,
+uploads, outputs, checkpoints, and translation memory.
+
+Do not commit runtime data or local model files to Git.
+
+Recommended `.gitignore` entries:
+
+```gitignore
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+translator_data/
+
+*.gguf
+*.bin
+*.safetensors
+
+.env
+```
+
+## Architecture
+
+```text
+Browser
+   ↓
+Flask UI / API
+   ↓
+Job Manager
+   ↓
+Document Processor
+   ↓
+Translation Pipeline
+   ├── Gemma 3 12B / llama.cpp
+   ├── MADLAD / CTranslate2
+   ├── Deterministic QA
+   └── Dorna 8B / llama.cpp
+   ↓
+Document Reconstruction
+   ↓
+Output
+```
+
+Only the model needed for the current stage is kept loaded where
+possible. This reduces memory pressure on machines with limited
+RAM/unified memory.
+
+## Troubleshooting
+
+### `Selected profile is missing usable models`
+
+Check model paths:
+
+```bash
+python app.py --config translator.config.json --doctor
+```
+
+The MADLAD path must point to its directory:
+
+```text
+.../Ai-Models/madlad
+```
+
+not:
+
+```text
+.../Ai-Models/madlad/model.bin
+```
+
+### Metal is not being used
+
+Run:
+
+```bash
+python -c "from llama_cpp import llama_cpp; print(llama_cpp.llama_supports_gpu_offload())"
+```
+
+If it returns `False`, reinstall `llama-cpp-python` with Metal support.
+
+### `PyTorch was not found`
+
+This is normally harmless for the current pipeline. Translina does not
+use PyTorch for model inference.
+
+### Out of memory
+
+Try:
+
+- closing other large applications
+- using the low-memory profile
+- reducing model context size
+- using smaller GGUF quantizations
+- processing fewer units per review request
+
+### Translation stopped midway
+
+Translina uses checkpoints. Open the job again and use resume when
+available.
+
+### PDF output differs from the source
+
+This is expected for some PDFs. Translation changes text length, so the
+reconstructed PDF may reflow.
+
+## Moving to another computer
+
+You need to copy:
+
+```text
+Translina/
+Ai-Models/
+```
+
+Then on the new computer:
+
+```text
+1. Install Python 3.12
+2. Create a fresh virtual environment
+3. Install dependencies
+4. Update model_root in translator.config.json
+5. Install Metal or CUDA support if applicable
+6. Run --doctor --probe-model
+7. Start the app
+```
+
+Do **not** copy `.venv` between macOS and Windows. Recreate it on the
+destination machine.
+
+## Limitations
+
+- Automatic translation can still make mistakes.
+- Human review is recommended for medical, legal, regulatory,
+  contractual, and safety-critical documents.
+- Scanned PDF OCR is not included.
+- PDF layout may reflow.
+- DOCX pagination can change.
+- Translation speed depends heavily on hardware and selected quality
+  mode.
+
+## Contributing
+
+Bug reports and pull requests are welcome.
+
+For useful bug reports, include:
+
+- operating system
+- CPU/GPU
+- RAM
+- Python version
+- model/quantization
+- selected profile
+- input type
+- output of `--doctor`
+- relevant error message
+
+Do not attach confidential source documents to public issues.
+
+## License
+
+Add the project's license here before publishing the repository
+publicly.
+
+If you have not selected a license yet, do not assume that public source
+code is automatically open source.
 
 ---
 
-# 🩺 Diagnostics
-
-If Translina is not starting correctly, run:
+**Recommended first test after every installation:**
 
 ```bash
 python app.py --config translator.config.json --doctor --probe-model
 ```
 
-This should be the first troubleshooting step when checking model or runtime configuration.
-
----
-
-# ⚠️ Limitations
-
-Translina is designed to improve translation quality through multiple LLM passes, but automatic translation should not be considered infallible.
-
-Human review is still recommended for sensitive or high-stakes material such as:
-
-- legal documents
-- medical documents
-- contracts
-- regulatory content
-- safety-critical material
-
-Current limitations also include:
-
-- no OCR for scanned PDFs
-- no PowerPoint translation
-- no Excel translation
-- PDF layout may reflow
-- translated DOCX pagination may differ from the original
-
----
-
-# 🛠️ Tech Stack
-
-```text
-Python
-Flask
-llama.cpp
-llama-cpp-python
-python-docx
-lxml
-PyMuPDF
-GGUF
-```
-
-Optional components may include **LibreOffice** for document rendering where available.
-
----
-
-# 📁 Basic Usage
-
-```text
-1. Install the required Python packages
-             ↓
-2. Download / host the GGUF models locally
-             ↓
-3. Add model paths to translator.config.json
-             ↓
-4. Run the diagnostic
-             ↓
-5. Start app.py
-             ↓
-6. Open http://127.0.0.1:5000
-             ↓
-7. Select text or a document
-             ↓
-8. Choose source language
-             ↓
-9. Choose target language
-             ↓
-10. Select a tone
-             ↓
-11. Start translation
-             ↓
-12. Download the translated result
-```
-
----
-
-# 🤝 Contributing
-
-Contributions, bug reports, testing, and suggestions are welcome.
-
-If you find an issue, please include useful information such as:
-
-- operating system
-- Python version
-- model being used
-- available RAM
-- inference backend
-- input document type
-- relevant error output
-
-Please do **not** include confidential source documents in public bug reports.
-
----
+If the probe succeeds, start the server and run a short real translation
+before testing large documents.

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Local LLM document translator.
+"""Local hybrid document translator.
 
 Run:
     python app.py --config translator.config.json
 
 Required packages:
-    flask llama-cpp-python lxml python-docx pymupdf
+    flask ctranslate2 transformers sentencepiece llama-cpp-python lxml python-docx pymupdf
 
 The web application is intentionally self-contained: configuration, model
 orchestration, document adapters, job persistence, SSE progress, and HTML live
@@ -41,7 +41,7 @@ from urllib.parse import urlparse
 
 LANGUAGES = {"fa": "فارسی", "en": "English", "ar": "العربية"}
 RTL_LANGUAGES = {"fa", "ar"}
-APP_VERSION = "2.2.0-balanced-quality"
+APP_VERSION = "3.1.0-direct-gguf-metal"
 
 
 class TranslatorError(RuntimeError):
@@ -93,7 +93,7 @@ def _expand_value(value: Any, variables: dict[str, str], base_dir: Path) -> Any:
     expanded = os.path.expandvars(os.path.expanduser(expanded))
     looks_like_path = (
         expanded.startswith((".", "..", "/", "~"))
-        or "/" in expanded
+        # or "/" in expanded
         or "\\" in expanded
         or expanded.lower().endswith((".gguf", ".db"))
     )
@@ -162,12 +162,22 @@ def total_memory_bytes() -> int:
         return 8 * 1024**3
 
 
+
 def _model_exists(config: dict[str, Any], model_key: str | None) -> bool:
+    """Return whether a configured local model exists without loading it."""
     if not model_key:
         return False
     model = config.get("models", {}).get(model_key, {})
-    path = model.get("path")
-    return bool(path and Path(path).is_file())
+    if not isinstance(model, dict):
+        return False
+    backend = str(model.get("backend", "")).lower()
+    if backend == "ctranslate2":
+        model_path = Path(str(model.get("path", "")))
+        return model_path.is_dir() and (model_path / "model.bin").is_file()
+    if backend == "llama_cpp":
+        model_path = Path(str(model.get("path", "")))
+        return model_path.is_file() and model_path.suffix.lower() == ".gguf"
+    return False
 
 
 def choose_profile(
@@ -179,31 +189,44 @@ def choose_profile(
         else globals()["total_memory_bytes"]()
     )
     threshold = (
-        float(config.get("runtime", {}).get("low_memory_threshold_gb", 10)) * 1024**3
+        float(config.get("runtime", {}).get("low_memory_threshold_gb", 12)) * 1024**3
     )
     requested = str(config.get("runtime", {}).get("memory_profile", "auto")).lower()
-    desired = (
-        requested
-        if requested in {"low", "high"}
-        else ("low" if memory <= threshold else "high")
-    )
+    if requested in {"low", "high"}:
+        desired = requested
+    elif sys.platform == "darwin":
+        # Unified memory must hold the OS, GGUF weights and KV cache. Be conservative
+        # on 16/24 GB Macs; Metal still accelerates the GGUF models in the low profile.
+        desired = "low" if memory <= 24 * 1024**3 else "high"
+    else:
+        desired = "low" if memory <= threshold else "high"
+
     profiles = config.get("profiles", {})
     profile = copy.deepcopy(profiles.get(desired, {}))
-    required = {profile.get("translator"), profile.get("reviewer")}
-    required.discard(None)
-    if desired == "high" and (
-        not required or not all(_model_exists(config, key) for key in required)
-    ):
-        desired = "low"
-        profile = copy.deepcopy(profiles.get("low", {}))
     if not profile:
         raise TranslatorError(f"Runtime profile '{desired}' is not configured.")
-    if not _model_exists(config, profile.get("translator")):
+
+    required_roles = ["translator", "analyst", "reviewer"]
+    missing = [
+        role
+        for role in required_roles
+        if not _model_exists(config, profile.get(role))
+    ]
+    if missing and desired == "high":
+        desired = "low"
+        profile = copy.deepcopy(profiles.get("low", {}))
+        missing = [
+            role
+            for role in required_roles
+            if not _model_exists(config, profile.get(role))
+        ]
+    if missing:
         raise TranslatorError(
-            "No usable translator model was found for the selected profile."
+            "Selected profile is missing usable models for: " + ", ".join(missing)
         )
-    if not _model_exists(config, profile.get("reviewer")):
-        profile["reviewer"] = profile["translator"]
+    polisher = profile.get("polisher")
+    if polisher and not _model_exists(config, polisher):
+        profile["polisher"] = None
     return desired, profile
 
 
@@ -218,19 +241,32 @@ def is_loopback_host(host: str) -> bool:
     return normalized in {"localhost", "127.0.0.1", "::1"}
 
 
-def detect_runtime_backend() -> str:
-    """Report what the installed llama.cpp build can actually offload to."""
+
+def detect_llama_acceleration() -> str:
+    """Return the llama.cpp acceleration mode exposed by the installed build."""
     try:
         from llama_cpp import llama_cpp as llama_backend
     except (ImportError, OSError):
         return "unavailable"
     try:
-        supports_offload = bool(llama_backend.llama_supports_gpu_offload())
+        gpu = bool(llama_backend.llama_supports_gpu_offload())
     except (AttributeError, OSError):
-        supports_offload = False
-    if not supports_offload:
+        gpu = False
+    if not gpu:
         return "cpu"
     return "metal" if sys.platform == "darwin" else "gpu-offload"
+
+
+def detect_runtime_backend() -> str:
+    """Report the local inference stack available in this Python environment."""
+    try:
+        import ctranslate2  # noqa: F401
+        import transformers  # noqa: F401
+        import sentencepiece  # noqa: F401
+        import llama_cpp  # noqa: F401
+    except (ImportError, OSError):
+        return "incomplete"
+    return f"ctranslate2+llama.cpp({detect_llama_acceleration()})"
 
 
 def output_name(
@@ -332,11 +368,25 @@ class TranslationUnit:
         return "".join(self.segments)
 
 
-def _model_manifest_entry(config: dict[str, Any], model_key: str) -> dict[str, Any]:
-    path = Path(str(config.get("models", {}).get(model_key, {}).get("path", "")))
-    entry: dict[str, Any] = {"key": model_key, "path": str(path)}
+
+def _model_manifest_entry(config: dict[str, Any], model_key: str | None) -> dict[str, Any]:
+    if not model_key:
+        return {"key": None}
+    model = copy.deepcopy(config.get("models", {}).get(model_key, {}))
+    backend = str(model.get("backend", ""))
+    entry: dict[str, Any] = {"key": model_key, "backend": backend}
+    if backend == "ctranslate2":
+        path = Path(str(model.get("path", "")))
+        entry["path"] = str(path)
+        stat_path = path / "model.bin"
+    elif backend == "llama_cpp":
+        path = Path(str(model.get("path", "")))
+        entry["path"] = str(path)
+        stat_path = path
+    else:
+        return entry
     try:
-        stat = path.stat()
+        stat = stat_path.stat()
         entry.update({"size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
     except OSError:
         entry.update({"size": -1, "mtime_ns": -1})
@@ -349,8 +399,6 @@ def build_checkpoint_manifest(
     units: Sequence[TranslationUnit],
     input_budget: int,
 ) -> dict[str, Any]:
-    translator = str(profile.get("translator", ""))
-    reviewer = str(profile.get("reviewer", translator))
     unit_hashes = {
         unit.unit_id: hashlib.sha256(
             json.dumps(unit.segments, ensure_ascii=False, separators=(",", ":")).encode(
@@ -360,11 +408,12 @@ def build_checkpoint_manifest(
         for unit in units
     }
     return {
-        "version": 1,
+        "version": 3,
         "route": {
-            "translator": _model_manifest_entry(config, translator),
-            "reviewer": _model_manifest_entry(config, reviewer),
-            "context_size": int(profile.get("context_size", 0)),
+            "translator": _model_manifest_entry(config, profile.get("translator")),
+            "analyst": _model_manifest_entry(config, profile.get("analyst")),
+            "reviewer": _model_manifest_entry(config, profile.get("reviewer")),
+            "polisher": _model_manifest_entry(config, profile.get("polisher")),
             "input_budget": int(input_budget),
         },
         "units": unit_hashes,
@@ -373,14 +422,19 @@ def build_checkpoint_manifest(
 
 def reusable_checkpoint_translations(
     state: dict[str, Any], manifest: dict[str, Any]
-) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+) -> tuple[
+    dict[str, list[str]],
+    dict[str, list[str]],
+    dict[str, list[str]],
+    dict[str, str],
+]:
     previous = state.get("manifest")
     if not isinstance(previous, dict) or previous.get("route") != manifest.get("route"):
-        return {}, {}
+        return {}, {}, {}, {}
     previous_units = previous.get("units", {})
     current_units = manifest.get("units", {})
     if not isinstance(previous_units, dict) or not isinstance(current_units, dict):
-        return {}, {}
+        return {}, {}, {}, {}
     valid_ids = {
         unit_id
         for unit_id, digest in current_units.items()
@@ -392,12 +446,18 @@ def reusable_checkpoint_translations(
         if not isinstance(values, dict):
             return {}
         return {
-            unit_id: value
+            unit_id: [str(item) for item in value]
             for unit_id, value in values.items()
             if unit_id in valid_ids and isinstance(value, list)
         }
 
-    return filtered("drafts"), filtered("finals")
+    cache = state.get("mt_cache", {})
+    mt_cache = (
+        {str(k): str(v) for k, v in cache.items() if isinstance(v, str)}
+        if isinstance(cache, dict)
+        else {}
+    )
+    return filtered("drafts"), filtered("finals"), filtered("polished"), mt_cache
 
 
 def adaptive_batches(
@@ -632,7 +692,10 @@ def canonical_numbers(text: str) -> list[str]:
     return [match.group(0).translate(_NUMBER_TRANSLATION) for match in _NUMBER_PATTERN.finditer(text)]
 
 
-def quality_flags(source: str, target: str) -> list[str]:
+
+def quality_flags(
+    source: str, target: str, target_language: str | None = None
+) -> list[str]:
     flags: list[str] = []
     if not target.strip():
         return ["empty"]
@@ -648,9 +711,16 @@ def quality_flags(source: str, target: str) -> list[str]:
     target_emails = re.findall(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", target)
     if source_emails != target_emails:
         flags.append("emails")
+    if re.search(r"ZXQPH[A-Z]+QXZ", target):
+        flags.append("placeholder")
     ratio = len(target.strip()) / max(1, len(source.strip()))
-    if len(source.strip()) > 80 and (ratio < 0.25 or ratio > 4.0):
+    if len(source.strip()) > 80 and (ratio < 0.28 or ratio > 3.8):
         flags.append("length")
+    if target_language in {"fa", "ar"} and len(source) > 100:
+        latin_words = re.findall(r"\b[A-Za-z]{4,}\b", target)
+        source_latin = re.findall(r"\b[A-Za-z]{4,}\b", source)
+        if len(latin_words) >= max(8, int(len(source_latin) * 0.65)):
+            flags.append("source_leakage")
     return flags
 
 
@@ -680,8 +750,13 @@ def glossary_flags(source: str, target: str, analysis: dict[str, Any]) -> list[s
     return flags
 
 
+
 class ModelManager:
-    """Own exactly one llama.cpp model at a time."""
+    """Local runtime: CTranslate2 for MADLAD and llama.cpp for GGUF LLMs.
+
+    Exactly one GGUF model is resident at a time. This is important on Apple
+    Silicon unified memory and on smaller NVIDIA cards.
+    """
 
     def __init__(
         self,
@@ -692,143 +767,329 @@ class ModelManager:
         self.config = config
         self.profile = profile
         self.status_callback = status_callback or (lambda *args: None)
-        self._model: Any = None
-        self._model_key: str | None = None
         self._lock = threading.RLock()
+        self._mt_models: dict[str, Any] = {}
+        self._tokenizers: dict[str, Any] = {}
+        self._llm: Any = None
+        self._llm_key: str | None = None
 
     def _notify(self, state: str, model_key: str) -> None:
         self.status_callback(state, model_key)
 
-    def _load(self, model_key: str) -> Any:
+    def _model_config(self, model_key: str) -> dict[str, Any]:
+        model = self.config.get("models", {}).get(model_key)
+        if not isinstance(model, dict):
+            raise ModelLoadError(f"Model '{model_key}' is not configured.")
+        return model
+
+    def _load_tokenizer(self, model_key: str) -> Any:
         with self._lock:
-            if self._model is not None and self._model_key == model_key:
-                return self._model
-            self.unload()
+            if model_key in self._tokenizers:
+                return self._tokenizers[model_key]
+            model = self._model_config(model_key)
+            if str(model.get("backend", "")).lower() != "ctranslate2":
+                return None
+            path = Path(str(model.get("tokenizer_path") or model.get("path") or ""))
+            if not path.is_dir():
+                raise ModelLoadError(f"Tokenizer directory not found: {path}")
+            try:
+                from transformers import AutoTokenizer
+            except ImportError as exc:
+                raise ModelLoadError(
+                    "transformers is not installed. Install transformers and sentencepiece."
+                ) from exc
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    str(path), local_files_only=True, use_fast=True
+                )
+            except Exception:
+                try:
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        str(path), local_files_only=True, use_fast=False
+                    )
+                except Exception as exc:
+                    raise ModelLoadError(
+                        f"Could not load tokenizer for '{model_key}': {exc}"
+                    ) from exc
+            self._tokenizers[model_key] = tokenizer
+            return tokenizer
+
+    @staticmethod
+    def _resolve_ct2_runtime(model: dict[str, Any]) -> tuple[str, str]:
+        requested = str(model.get("device", "auto")).lower()
+        compute = str(model.get("compute_type", "auto"))
+        if requested != "auto":
+            return requested, compute
+        # CTranslate2 prebuilt GPU support is CUDA/NVIDIA. Apple Silicon uses ARM64 CPU.
+        if sys.platform == "darwin":
+            return "cpu", str(model.get("cpu_compute_type", "int8"))
+        try:
+            import ctranslate2
+            cuda_types = ctranslate2.get_supported_compute_types("cuda")
+            if cuda_types:
+                preferred = str(model.get("cuda_compute_type", "int8_float16"))
+                if preferred in cuda_types:
+                    return "cuda", preferred
+                if "float16" in cuda_types:
+                    return "cuda", "float16"
+                return "cuda", sorted(cuda_types)[0]
+        except Exception:
+            pass
+        return "cpu", str(model.get("cpu_compute_type", "int8"))
+
+    def _load_mt(self, model_key: str) -> Any:
+        with self._lock:
+            if model_key in self._mt_models:
+                return self._mt_models[model_key]
+            model = self._model_config(model_key)
+            if str(model.get("backend", "")).lower() != "ctranslate2":
+                raise ModelLoadError(f"Model '{model_key}' is not a CTranslate2 model.")
+            path = Path(str(model.get("path", "")))
+            if not path.is_dir() or not (path / "model.bin").is_file():
+                raise ModelLoadError(f"CTranslate2 model directory not found: {path}")
+            self._notify("loading", model_key)
+            try:
+                import ctranslate2
+            except ImportError as exc:
+                self._notify("error", model_key)
+                raise ModelLoadError("ctranslate2 is not installed.") from exc
+            self._load_tokenizer(model_key)
+            device, compute_type = self._resolve_ct2_runtime(model)
+            kwargs = {
+                "device": device,
+                "compute_type": compute_type,
+                "inter_threads": int(model.get("inter_threads", 1)),
+                "intra_threads": int(
+                    model.get("intra_threads", max(1, (os.cpu_count() or 4) - 1))
+                ),
+            }
+            try:
+                translator = ctranslate2.Translator(str(path), **kwargs)
+            except Exception as first_exc:
+                if device == "cuda" and bool(model.get("allow_cpu_fallback", True)):
+                    try:
+                        translator = ctranslate2.Translator(
+                            str(path),
+                            device="cpu",
+                            compute_type=str(model.get("cpu_compute_type", "int8")),
+                            inter_threads=1,
+                            intra_threads=max(1, (os.cpu_count() or 4) - 1),
+                        )
+                    except Exception as second_exc:
+                        self._notify("error", model_key)
+                        raise ModelLoadError(
+                            f"Could not load MT model on GPU ({first_exc}) or CPU ({second_exc})."
+                        ) from second_exc
+                else:
+                    self._notify("error", model_key)
+                    raise ModelLoadError(
+                        f"Could not load MT model '{model_key}': {first_exc}"
+                    ) from first_exc
+            self._mt_models[model_key] = translator
+            self._notify("loaded", model_key)
+            return translator
+
+    @staticmethod
+    def _gpu_layers_for(model: dict[str, Any]) -> int:
+        configured = model.get("gpu_layers", "auto")
+        if configured != "auto":
+            return int(configured)
+        return -1 if detect_llama_acceleration() in {"metal", "gpu-offload"} else 0
+
+    def _load_llm(self, model_key: str) -> Any:
+        with self._lock:
+            if self._llm is not None and self._llm_key == model_key:
+                return self._llm
+            self._unload_llm_locked()
+            model = self._model_config(model_key)
+            if str(model.get("backend", "")).lower() != "llama_cpp":
+                raise ModelLoadError(f"Model '{model_key}' is not configured for llama.cpp.")
+            path = Path(str(model.get("path", "")))
+            if not path.is_file():
+                raise ModelLoadError(f"GGUF model file not found: {path}")
             self._notify("loading", model_key)
             try:
                 from llama_cpp import Llama
-            except ImportError as exc:
+            except (ImportError, OSError) as exc:
                 self._notify("error", model_key)
                 raise ModelLoadError(
-                    "llama-cpp-python is not installed. Run 'pip install llama-cpp-python'."
+                    "llama-cpp-python is not installed or could not be loaded."
                 ) from exc
-            model_config = self.config.get("models", {}).get(model_key)
-            if not model_config:
-                self._notify("error", model_key)
-                raise ModelLoadError(f"Model '{model_key}' is not configured.")
-            model_path = Path(str(model_config.get("path", "")))
-            if not model_path.is_file():
-                self._notify("error", model_key)
-                raise ModelLoadError(f"Model file not found: {model_path}")
-            runtime = self.config.get("runtime", {})
-            threads_value = runtime.get("threads", "auto")
-            threads = (
-                max(1, (os.cpu_count() or 4) - 1)
-                if threads_value == "auto"
-                else int(threads_value)
+
+            threads = model.get("threads", "auto")
+            n_threads = (
+                max(1, (os.cpu_count() or 4) - 2)
+                if threads == "auto"
+                else max(1, int(threads))
             )
-            gpu_value = runtime.get("gpu_layers", "auto")
-            if gpu_value == "auto":
-                gpu_layers = (
-                    -1 if detect_runtime_backend() in {"metal", "gpu-offload"} else 0
-                )
-            else:
-                gpu_layers = int(gpu_value)
             kwargs: dict[str, Any] = {
-                "model_path": str(model_path),
-                "n_ctx": int(self.profile.get("context_size", 4096)),
-                "n_batch": int(self.profile.get("batch_size", 128)),
-                "n_threads": threads,
-                "n_gpu_layers": gpu_layers,
-                "verbose": bool(runtime.get("verbose_model", False)),
+                "model_path": str(path),
+                "n_ctx": int(model.get("context_size", 8192)),
+                "n_batch": int(model.get("batch_size", 512)),
+                "n_threads": n_threads,
+                "n_gpu_layers": self._gpu_layers_for(model),
+                "use_mmap": bool(model.get("use_mmap", True)),
+                "use_mlock": bool(model.get("use_mlock", False)),
+                "verbose": bool(model.get("verbose", False)),
             }
-            if model_config.get("chat_format"):
-                kwargs["chat_format"] = model_config["chat_format"]
+            if model.get("chat_format"):
+                kwargs["chat_format"] = str(model["chat_format"])
             try:
-                self._model = Llama(**kwargs)
+                self._llm = Llama(**kwargs)
             except Exception as exc:
+                self._llm = None
+                self._llm_key = None
                 self._notify("error", model_key)
+                hint = ""
+                if sys.platform == "darwin":
+                    hint = " Verify that llama-cpp-python was built with Metal support."
                 raise ModelLoadError(
-                    f"Could not load model '{model_key}': {exc}"
+                    f"Could not load GGUF model '{model_key}': {exc}.{hint}"
                 ) from exc
-            self._model_key = model_key
+            self._llm_key = model_key
             self._notify("loaded", model_key)
-            return self._model
+            return self._llm
 
     def count_tokens(self, model_key: str, text: str) -> int:
-        model = self._load(model_key)
-        try:
-            return len(model.tokenize(text.encode("utf-8"), add_bos=False))
-        except TypeError:
-            return len(model.tokenize(text.encode("utf-8")))
+        model = self._model_config(model_key)
+        backend = str(model.get("backend", "")).lower()
+        if backend == "ctranslate2":
+            tokenizer = self._load_tokenizer(model_key)
+            return len(tokenizer.encode(text, add_special_tokens=True))
+        if backend == "llama_cpp":
+            llm = self._load_llm(model_key)
+            try:
+                return len(llm.tokenize(text.encode("utf-8"), add_bos=False))
+            except TypeError:
+                return len(llm.tokenize(text.encode("utf-8")))
+        return max(1, int(len(text) / 2.6) + 8)
 
-    def generate(
+    def source_token_limit(self, model_key: str) -> int:
+        model = self._model_config(model_key)
+        return max(64, int(model.get("max_source_tokens", 420)))
+
+    def translate_texts(
+        self,
+        model_key: str,
+        texts: Sequence[str],
+        target_language: str,
+    ) -> list[str]:
+        if not texts:
+            return []
+        model = self._model_config(model_key)
+        if str(model.get("backend", "")).lower() != "ctranslate2":
+            raise TranslatorError("The translation role must use a CTranslate2 model.")
+        translator = self._load_mt(model_key)
+        tokenizer = self._load_tokenizer(model_key)
+        target_tags = model.get("target_tags", {})
+        target_code = str(target_tags.get(target_language, target_language))
+        token_batches: list[list[str]] = []
+        limit = self.source_token_limit(model_key)
+        for text in texts:
+            prompt = f"<2{target_code}> {text}"
+            ids = tokenizer.encode(prompt, add_special_tokens=True)
+            if len(ids) > limit:
+                raise ModelCapacityError(
+                    f"MT input is {len(ids)} tokens, above configured limit {limit}."
+                )
+            token_batches.append(tokenizer.convert_ids_to_tokens(ids))
+        try:
+            results = translator.translate_batch(
+                token_batches,
+                beam_size=max(1, int(model.get("beam_size", 2))),
+                max_decoding_length=max(64, int(model.get("max_decoding_length", 640))),
+                repetition_penalty=float(model.get("repetition_penalty", 1.05)),
+                no_repeat_ngram_size=max(0, int(model.get("no_repeat_ngram_size", 0))),
+                batch_type="tokens",
+                max_batch_size=max(1, int(model.get("max_batch_size", 2048))),
+            )
+        except Exception as exc:
+            message = str(exc).lower()
+            error_type = (
+                ModelCapacityError
+                if any(x in message for x in ("memory", "allocate", "cuda", "length"))
+                else TranslatorError
+            )
+            raise error_type(f"CTranslate2 translation failed: {exc}") from exc
+        outputs: list[str] = []
+        for result in results:
+            tokens = result.hypotheses[0]
+            ids = tokenizer.convert_tokens_to_ids(tokens)
+            value = tokenizer.decode(ids, skip_special_tokens=True).strip()
+            outputs.append(value)
+        return outputs
+
+    def generate_json(
         self,
         model_key: str,
         messages: list[dict[str, str]],
         max_tokens: int,
         temperature: float,
-    ) -> str:
-        model = self._load(model_key)
-        with self._lock:
-            kwargs = {
-                "messages": messages,
-                "max_tokens": int(max_tokens),
-                "temperature": float(temperature),
-                "top_p": 0.9,
-                "repeat_penalty": 1.05,
-            }
+    ) -> dict[str, Any]:
+        model = self._model_config(model_key)
+        if str(model.get("backend", "")).lower() != "llama_cpp":
+            raise TranslatorError("LLM analysis/review roles must use a GGUF llama.cpp model.")
+        llm = self._load_llm(model_key)
+        kwargs: dict[str, Any] = {
+            "messages": messages,
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+            "top_p": float(model.get("top_p", 0.9)),
+            "repeat_penalty": float(model.get("repeat_penalty", 1.03)),
+        }
+        try:
             try:
-                try:
-                    response = model.create_chat_completion(
-                        **kwargs, response_format={"type": "json_object"}
-                    )
-                except (TypeError, ValueError):
-                    response = model.create_chat_completion(**kwargs)
-                choice = response["choices"][0]
-                if str(choice.get("finish_reason", "")).lower() == "length":
-                    raise ModelCapacityError(
-                        "Model generation reached the output-token limit."
-                    )
-                return str(choice["message"]["content"] or "")
-            except ModelCapacityError:
-                raise
-            except Exception as exc:
-                message = str(exc).lower()
-                capacity_markers = (
-                    "context window",
-                    "context is full",
-                    "exceed context",
-                    "kv cache",
-                    "out of memory",
-                    "failed to allocate",
-                    "could not allocate",
-                    " n_ctx",
-                    "oom",
+                response = llm.create_chat_completion(
+                    **kwargs, response_format={"type": "json_object"}
                 )
-                error_type = (
-                    ModelCapacityError
-                    if any(marker in message for marker in capacity_markers)
-                    else TranslatorError
+            except (TypeError, ValueError):
+                response = llm.create_chat_completion(**kwargs)
+            choice = response["choices"][0]
+            if str(choice.get("finish_reason", "")).lower() == "length":
+                raise ModelCapacityError(
+                    f"GGUF model '{model_key}' reached the output token limit."
                 )
-                raise error_type(
-                    f"Model generation failed ({model_key}): {exc}"
-                ) from exc
+            content = str(choice.get("message", {}).get("content") or "")
+            if not content.strip():
+                raise TranslatorError(f"GGUF model '{model_key}' returned empty output.")
+            return extract_json_object(content)
+        except (TranslatorError, ModelCapacityError):
+            raise
+        except Exception as exc:
+            message = str(exc).lower()
+            error_type = (
+                ModelCapacityError
+                if any(x in message for x in ("context", "kv cache", "memory", "allocate", "oom"))
+                else TranslatorError
+            )
+            raise error_type(f"GGUF generation failed ({model_key}): {exc}") from exc
 
-    def unload(self) -> None:
+    def _unload_llm_locked(self) -> None:
+        model = self._llm
+        key = self._llm_key
+        self._llm = None
+        self._llm_key = None
+        if model is not None:
+            try:
+                close = getattr(model, "close", None)
+                if callable(close):
+                    close()
+            finally:
+                del model
+                if key:
+                    self._notify("unloaded", key)
+            gc.collect()
+
+    def unload(self, model_key: str | None = None) -> None:
         with self._lock:
-            model, self._model = self._model, None
-            model_key = self._model_key
-            self._model_key = None
-            if model is not None:
-                try:
-                    close = getattr(model, "close", None)
-                    if callable(close):
-                        close()
-                finally:
-                    del model
-                if model_key:
-                    self._notify("unloaded", model_key)
+            mt_keys = list(self._mt_models) if model_key is None else [model_key]
+            for key in mt_keys:
+                translator = self._mt_models.pop(key, None)
+                if translator is not None:
+                    del translator
+                    self._notify("unloaded", key)
+            if model_key is None or self._llm_key == model_key:
+                self._unload_llm_locked()
             gc.collect()
 
 
@@ -844,7 +1105,15 @@ TONE_GUIDANCE = {
 }
 
 
+
 class TranslationPipeline:
+    """Specialized MT -> semantic post-edit -> deterministic QA -> Persian polish."""
+
+    IMMUTABLE_PATTERN = re.compile(
+        r"https?://[^\s<>()]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|"
+        r"(?<!\w)[+\-−]?(?:[0-9٠-٩۰-۹][0-9٠-٩۰-۹,٬.٫/⁄:：\-]*[0-9٠-٩۰-۹]|[0-9٠-٩۰-۹])(?!\w)"
+    )
+
     def __init__(
         self,
         config: dict[str, Any],
@@ -864,6 +1133,7 @@ class TranslationPipeline:
         self.checkpoint = checkpoint or (lambda *args, **kwargs: None)
         self.options = config.get("translation", {})
         self.quality_warnings: dict[str, list[str]] = {}
+        self._polish_hints: set[str] = set()
 
     def _check_cancelled(self) -> None:
         if self.cancelled():
@@ -871,50 +1141,53 @@ class TranslationPipeline:
         if self.paused():
             raise JobPaused("Translation paused at a safe checkpoint.")
 
-    def _json_call(
+    def _llm_json_call(
         self,
         model_key: str,
         messages: list[dict[str, str]],
         max_tokens: int,
         temperature: float,
     ) -> dict[str, Any]:
-        retries = int(self.options.get("max_retries", 2))
+        retries = max(0, int(self.options.get("max_retries", 2)))
         last_error: Exception | None = None
-        working_messages = list(messages)
         for attempt in range(retries + 1):
             self._check_cancelled()
             try:
-                rendered = json.dumps(working_messages, ensure_ascii=False)
-                input_tokens = self.models.count_tokens(model_key, rendered)
-                context_size = int(self.profile.get("context_size", 4096))
-                safety = int(self.options.get("context_safety_tokens", 512))
-                safe_output = context_size - safety - input_tokens
-                if safe_output < 64:
-                    raise ModelCapacityError(
-                        f"Rendered request uses {input_tokens} tokens and leaves no safe output space."
-                    )
-                raw = self.models.generate(
+                return self.models.generate_json(
                     model_key,
-                    working_messages,
-                    min(int(max_tokens), safe_output),
-                    temperature,
+                    messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
                 )
-                return extract_json_object(raw)
-            except ModelCapacityError:
-                raise
-            except TranslatorError as exc:
+            except (TranslatorError, ModelLoadError) as exc:
                 last_error = exc
                 if attempt >= retries:
                     break
-                working_messages = list(messages) + [
+                messages = list(messages) + [
                     {
                         "role": "user",
-                        "content": "Return only one valid JSON object matching the requested schema.",
+                        "content": "Return exactly one valid JSON object and no markdown.",
                     }
                 ]
-        raise TranslatorError(
-            f"The model returned invalid structured output: {last_error}"
-        )
+        raise TranslatorError(f"Structured model call failed: {last_error}")
+
+    def _representative_sample(self, units: Sequence[TranslationUnit]) -> str:
+        nonempty = [unit.text for unit in units if unit.text.strip()]
+        if not nonempty:
+            return ""
+        picks: list[str] = []
+        indices = list(range(min(4, len(nonempty))))
+        if len(nonempty) > 8:
+            middle = len(nonempty) // 2
+            indices.extend([max(0, middle - 1), middle])
+        indices.extend(range(max(0, len(nonempty) - 4), len(nonempty)))
+        seen: set[int] = set()
+        for index in indices:
+            if index not in seen:
+                picks.append(nonempty[index])
+                seen.add(index)
+        sample = "\n\n---\n\n".join(picks)
+        return sample[: max(2000, int(self.options.get("analysis_max_chars", 14000)))]
 
     def _analyze(
         self,
@@ -923,466 +1196,411 @@ class TranslationPipeline:
         target_language: str,
         tone: str,
     ) -> dict[str, Any]:
-        model_key = self.profile["translator"]
-        sample = "\n\n".join(unit.text for unit in units if unit.text.strip())
-        reserved = min(1024, int(self.options.get("reserved_output_tokens", 1536)))
-        context_size = int(self.profile.get("context_size", 4096))
-        safety = int(self.options.get("context_safety_tokens", 512))
-        fixed_analysis_prompt = (
-            "You are a senior translation analyst. Return JSON with keys domain, audience, summary, "
-            "style, and terms. terms is an array of recurring multiword concepts with source, target, and "
-            "locked=false. Prefer an empty terms list over a speculative or literal term. Do not translate "
-            "the document."
-        )
-        fixed_tokens = self.models.count_tokens(model_key, fixed_analysis_prompt) + 128
-        sample_budget = max(64, context_size - reserved - safety - fixed_tokens)
-        sample = truncate_to_token_budget(
-            sample,
-            lambda value: self.models.count_tokens(model_key, value),
-            sample_budget,
-        )
-        prompt = {
+        model_key = str(self.profile.get("analyst") or self.profile.get("reviewer"))
+        sample = self._representative_sample(units)
+        payload = {
             "source_language": LANGUAGES[source_language],
             "target_language": LANGUAGES[target_language],
             "requested_tone": tone,
             "document_sample": sample,
         }
-        messages = [
-            {
-                "role": "system",
-                "content": (fixed_analysis_prompt),
-            },
-            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-        ]
-        return self._json_call(
-            model_key,
-            messages,
-            max_tokens=reserved,
-            temperature=0.05,
-        )
-
-    def _batch_budget(self, model_key: str, fixed_context: str) -> int:
-        context_size = int(self.profile.get("context_size", 4096))
-        reserved = int(self.options.get("reserved_output_tokens", 1536))
-        safety = int(self.options.get("context_safety_tokens", 512))
-        fixed = self.models.count_tokens(model_key, fixed_context)
-        return context_input_budget(
-            context_size=context_size,
-            fixed_tokens=fixed,
-            reserved_output_tokens=reserved,
-            safety_tokens=safety,
-        )
-
-    def _translate_batch(
-        self,
-        model_key: str,
-        batch: Sequence[TranslationUnit],
-        source_language: str,
-        target_language: str,
-        tone: str,
-        analysis: dict[str, Any],
-        previous: list[dict[str, str]],
-    ) -> dict[str, list[str]]:
-        previous = fit_previous_context(
-            previous,
-            lambda text: self.models.count_tokens(model_key, text),
-            max(128, int(self.profile.get("context_size", 4096) * 0.12)),
-        )
-        schema = {
-            unit.unit_id: ["one translated string per input segment"] for unit in batch
-        }
-        payload = {
-            "source_language": LANGUAGES[source_language],
-            "target_language": LANGUAGES[target_language],
-            "tone": TONE_GUIDANCE.get(tone, tone),
-            "document_profile": analysis,
-            "previous_context": previous,
-            "units": [
-                {
-                    "id": unit.unit_id,
-                    "segments": unit.segments,
-                    "protected_segment_indices": unit.metadata.get(
-                        "protected_segment_indices", []
-                    ),
-                }
-                for unit in batch
-            ],
-            "output_schema": {"translations": schema},
-        }
         system = (
-            "You are an elite professional translator. Transfer every meaning accurately, then write as a native "
-            "author in the target language. Never translate literally when native syntax requires restructuring. "
-            "Do not add, omit, explain, censor, or summarize. Preserve numbers, URLs, names, negation, ambiguity, "
-            "and formatting boundaries. Reuse one accurate target expression for every recurring source concept; "
-            "treat multiword species names, idioms, titles, and technical terms as indivisible concepts and never "
-            "replace their head noun with a different object or species. Segments are formatting boundaries inside complete paragraphs: use the full "
-            "paragraph as context, and return exactly the same number of segments for every id. Return JSON only."
+            "You are a senior translation analyst. Do not translate the document. "
+            "Return JSON with keys domain, audience, summary, style, entities, and terms. "
+            "terms must be an array of {source,target,locked:false}. Include only recurring "
+            "multiword concepts whose translation is reasonably stable; prefer omission to guessing. "
+            "For Persian target text, choose natural Persian terminology, not word-for-word calques."
         )
-        try:
-            data = self._json_call(
-                model_key,
-                [
-                    {"role": "system", "content": system},
-                    {
-                        "role": "user",
-                        "content": json.dumps(payload, ensure_ascii=False),
-                    },
-                ],
-                max_tokens=int(self.options.get("reserved_output_tokens", 1536)),
-                temperature=float(self.options.get("temperature", 0.15)),
-            )
-        except ModelCapacityError:
-            if len(batch) <= 1:
-                raise
-            midpoint = len(batch) // 2
-            left_units = list(batch[:midpoint])
-            right_units = list(batch[midpoint:])
-            left = self._translate_batch(
-                model_key,
-                left_units,
-                source_language,
-                target_language,
-                tone,
-                analysis,
-                previous,
-            )
-            continued_context = list(previous) + [
-                {"source": unit.text, "target": "".join(left[unit.unit_id])}
-                for unit in left_units
-            ]
-            right = self._translate_batch(
-                model_key,
-                right_units,
-                source_language,
-                target_language,
-                tone,
-                analysis,
-                continued_context,
-            )
-            return {**left, **right}
-        translations = data.get("translations", {})
-        if not isinstance(translations, dict):
-            raise TranslatorError("Translation response has no translations object.")
-        integrity_retries = int(self.options.get("max_retries", 2))
-        for attempt in range(integrity_retries + 1):
-            try:
-                return {
-                    unit.unit_id: normalize_translation_segments(
-                        unit, translations.get(unit.unit_id)
-                    )
-                    for unit in batch
-                }
-            except TranslatorError:
-                if attempt >= integrity_retries:
-                    raise
-                correction = dict(payload)
-                correction["correction"] = (
-                    "Your previous response omitted an id, returned empty text, or changed formatting boundaries. "
-                    "Return a non-empty translation for every id, with exactly one output string per input segment, "
-                    "and keep protected indices separate."
-                )
-                data = self._json_call(
-                    model_key,
-                    [
-                        {"role": "system", "content": system},
-                        {
-                            "role": "user",
-                            "content": json.dumps(correction, ensure_ascii=False),
-                        },
-                    ],
-                    max_tokens=int(self.options.get("reserved_output_tokens", 1536)),
-                    temperature=0.0,
-                )
-                translations = data.get("translations", {})
-                if not isinstance(translations, dict):
-                    raise TranslatorError(
-                        "Translation correction has no translations object."
-                    )
-        raise SegmentIntegrityError("Protected segment validation failed.")
-
-    def _refresh_analysis(
-        self,
-        model_key: str,
-        analysis: dict[str, Any],
-        batch: Sequence[TranslationUnit],
-        drafts: dict[str, list[str]],
-    ) -> dict[str, Any]:
-        recent = [
-            {"source": unit.text, "translation": "".join(drafts[unit.unit_id])}
-            for unit in batch
-        ]
-        payload = {
-            "current_summary": analysis.get("rolling_summary")
-            or analysis.get("summary", ""),
-            "known_terms": analysis.get("terms", []),
-            "recent_units": recent,
-        }
-        data = self._json_call(
-            model_key,
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "Maintain compact translation memory for a long document. Return JSON with summary and terms. "
-                        "The summary must retain entities, relationships, argument state, character voices, unresolved "
-                        "references, and decisions needed later. terms contains only stable source/target pairs."
-                    ),
-                },
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-            max_tokens=min(640, int(self.options.get("reserved_output_tokens", 1536))),
-            temperature=0.05,
-        )
-        updated = dict(analysis)
-        if data.get("summary"):
-            updated["rolling_summary"] = str(data["summary"])[:4000]
-        if isinstance(data.get("terms"), list):
-            combined: list[Any] = []
-            seen: set[str] = set()
-            for term in [*analysis.get("terms", []), *data["terms"]]:
-                if not isinstance(term, dict):
-                    continue
-                key = json.dumps(term, ensure_ascii=False, sort_keys=True)
-                if key not in seen:
-                    seen.add(key)
-                    combined.append(term)
-                if len(combined) >= 120:
-                    break
-            updated["terms"] = combined
-        return updated
-
-    def _edit_batch(
-        self,
-        model_key: str,
-        batch: Sequence[TranslationUnit],
-        drafts: dict[str, list[str]],
-        source_language: str,
-        target_language: str,
-        tone: str,
-        analysis: dict[str, Any],
-    ) -> dict[str, list[str]]:
-        payload = {
-            "source_language": LANGUAGES[source_language],
-            "target_language": LANGUAGES[target_language],
-            "tone": TONE_GUIDANCE.get(tone, tone),
-            "profile": analysis,
-            "units": [
-                {
-                    "id": unit.unit_id,
-                    "source": unit.segments,
-                    "draft": drafts[unit.unit_id],
-                    "protected_segment_indices": unit.metadata.get(
-                        "protected_segment_indices", []
-                    ),
-                }
-                for unit in batch
-            ],
-        }
-        system = (
-            "You are a bilingual senior editor and fidelity checker. Compare source and draft, then return a final, "
-            "publication-ready target-language version. Improve native syntax, rhetoric, terminology, dialogue voice, "
-            "and flow as appropriate, while preserving every fact, number, URL, name, negation, intensity, and intended "
-            "ambiguity. Enforce one semantically accurate translation for every recurring multiword concept; never "
-            'change an animal, object, person, or technical concept into another. Return JSON {"translations": {id: [segments]}} '
-            "with exactly the original segment counts."
-        )
-        try:
-            data = self._json_call(
-                model_key,
-                [
-                    {"role": "system", "content": system},
-                    {
-                        "role": "user",
-                        "content": json.dumps(payload, ensure_ascii=False),
-                    },
-                ],
-                max_tokens=int(self.options.get("reserved_output_tokens", 1536)),
-                temperature=float(self.options.get("editor_temperature", 0.1)),
-            )
-        except ModelCapacityError:
-            if len(batch) <= 1:
-                raise
-            midpoint = len(batch) // 2
-            left = self._edit_batch(
-                model_key,
-                batch[:midpoint],
-                drafts,
-                source_language,
-                target_language,
-                tone,
-                analysis,
-            )
-            right = self._edit_batch(
-                model_key,
-                batch[midpoint:],
-                drafts,
-                source_language,
-                target_language,
-                tone,
-                analysis,
-            )
-            return {**left, **right}
-        translations = data.get("translations", {})
-        if not isinstance(translations, dict):
-            raise TranslatorError("Editor response has no translations object.")
-        integrity_retries = int(self.options.get("max_retries", 2))
-        for attempt in range(integrity_retries + 1):
-            try:
-                result: dict[str, list[str]] = {}
-                for unit in batch:
-                    value = translations.get(unit.unit_id, drafts[unit.unit_id])
-                    result[unit.unit_id] = normalize_translation_segments(unit, value)
-                return result
-            except SegmentIntegrityError:
-                if attempt >= integrity_retries:
-                    raise
-                correction = dict(payload)
-                correction["correction"] = (
-                    "Keep every protected formatting segment separate and return exactly "
-                    "one output string per source segment for every unit."
-                )
-                data = self._json_call(
-                    model_key,
-                    [
-                        {"role": "system", "content": system},
-                        {
-                            "role": "user",
-                            "content": json.dumps(correction, ensure_ascii=False),
-                        },
-                    ],
-                    max_tokens=int(self.options.get("reserved_output_tokens", 1536)),
-                    temperature=0.0,
-                )
-                translations = data.get("translations", {})
-                if not isinstance(translations, dict):
-                    raise TranslatorError(
-                        "Editor correction has no translations object."
-                    )
-        raise SegmentIntegrityError("Protected editor segment validation failed.")
-
-    def _fidelity_batch(
-        self,
-        model_key: str,
-        batch: Sequence[TranslationUnit],
-        finals: dict[str, list[str]],
-        source_language: str,
-        target_language: str,
-        analysis: dict[str, Any],
-    ) -> dict[str, list[str]]:
-        payload = {
-            "source_language": LANGUAGES[source_language],
-            "target_language": LANGUAGES[target_language],
-            "document_terms": analysis.get("terms", []),
-            "units": [
-                {
-                    "id": unit.unit_id,
-                    "source": unit.text,
-                    "translation": "".join(finals[unit.unit_id]),
-                }
-                for unit in batch
-            ],
-        }
-        system = (
-            "Act only as a bilingual translation auditor, not as an editor. For every unit compare source and target "
-            "for omissions, additions, mistranslation, names/entities, dates/numbers, negation, modality, intensity, "
-            'terminology, ambiguity, register, and character voice. Return JSON {"verdicts": {id: '
-            '{"ok": boolean, "issues": [{"severity": "critical|major|minor", '
-            '"code": string, "detail": string}]}}}. Use ok=true only when meaning and intended effect are preserved.'
-        )
-        try:
-            data = self._json_call(
-                model_key,
-                [
-                    {"role": "system", "content": system},
-                    {
-                        "role": "user",
-                        "content": json.dumps(payload, ensure_ascii=False),
-                    },
-                ],
-                max_tokens=min(
-                    768, int(self.options.get("reserved_output_tokens", 1536))
-                ),
-                temperature=0.0,
-            )
-        except ModelCapacityError:
-            if len(batch) <= 1:
-                raise
-            midpoint = len(batch) // 2
-            return {
-                **self._fidelity_batch(
-                    model_key,
-                    batch[:midpoint],
-                    finals,
-                    source_language,
-                    target_language,
-                    analysis,
-                ),
-                **self._fidelity_batch(
-                    model_key,
-                    batch[midpoint:],
-                    finals,
-                    source_language,
-                    target_language,
-                    analysis,
-                ),
-            }
-        verdicts = data.get("verdicts", {})
-        result: dict[str, list[str]] = {}
-        for unit in batch:
-            verdict = verdicts.get(unit.unit_id) if isinstance(verdicts, dict) else None
-            if not isinstance(verdict, dict):
-                result[unit.unit_id] = ["verdict: missing fidelity verdict"]
-                continue
-            issues: list[str] = []
-            raw_issues = verdict.get("issues", [])
-            if isinstance(raw_issues, list):
-                for issue in raw_issues:
-                    if isinstance(issue, dict):
-                        severity = str(issue.get("severity", "major")).lower()
-                        if severity not in {"critical", "major"}:
-                            continue
-                        code = str(issue.get("code", "fidelity"))
-                        detail = str(issue.get("detail", "meaning differs"))
-                        issues.append(f"{code}: {detail}")
-                    elif isinstance(issue, str):
-                        issues.append(issue)
-            if verdict.get("ok") is not True and not issues:
-                issues.append("fidelity: auditor rejected the translation")
-            result[unit.unit_id] = issues
-        return result
-
-    def _repair_unit(
-        self,
-        model_key: str,
-        unit: TranslationUnit,
-        candidate: list[str],
-        flags: list[str],
-        source_language: str,
-        target_language: str,
-    ) -> list[str]:
-        payload = {
-            "source_language": LANGUAGES[source_language],
-            "target_language": LANGUAGES[target_language],
-            "source": unit.segments,
-            "candidate": candidate,
-            "failed_checks": flags,
-        }
-        system = (
-            "Repair the translation only where needed. Restore every missing or changed number, URL, email, name, "
-            'or meaning while keeping natural target-language prose. Return JSON {"translations": {"unit": [segments]}}.'
-        )
-        data = self._json_call(
+        data = self._llm_json_call(
             model_key,
             [
                 {"role": "system", "content": system},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
-            max_tokens=int(self.options.get("reserved_output_tokens", 1536)),
+            max_tokens=min(1200, int(self.options.get("reserved_output_tokens", 1800))),
             temperature=0.05,
         )
-        return normalize_translation_segments(
-            unit, data.get("translations", {}).get("unit", candidate)
+        if not isinstance(data.get("terms"), list):
+            data["terms"] = []
+        return data
+
+    def _locked_terms(self, analysis: dict[str, Any]) -> list[dict[str, str]]:
+        terms: list[dict[str, str]] = []
+        configured = self.options.get("locked_glossary", [])
+        for raw in [
+            *(configured if isinstance(configured, list) else []),
+            *(analysis.get("terms", []) if isinstance(analysis.get("terms"), list) else []),
+        ]:
+            if not isinstance(raw, dict) or raw.get("locked") is not True:
+                continue
+            source = str(raw.get("source", "")).strip()
+            target = str(raw.get("target", "")).strip()
+            if source and target:
+                terms.append({"source": source, "target": target})
+        unique: dict[str, dict[str, str]] = {}
+        for term in terms:
+            unique[term["source"].casefold()] = term
+        return list(unique.values())
+
+    @staticmethod
+    def _alpha_id(index: int) -> str:
+        letters = []
+        value = index
+        while True:
+            letters.append(chr(ord("A") + value % 26))
+            value = value // 26 - 1
+            if value < 0:
+                return "".join(reversed(letters))
+
+    def _protect_text(
+        self, text: str, locked_terms: Sequence[dict[str, str]]
+    ) -> tuple[str, dict[str, str]]:
+        mapping: dict[str, str] = {}
+        counter = [0]
+
+        def placeholder(value: str) -> str:
+            token = f"ZXQPH{self._alpha_id(counter[0])}QXZ"
+            counter[0] += 1
+            mapping[token] = value
+            return token
+
+        protected = self.IMMUTABLE_PATTERN.sub(lambda m: placeholder(m.group(0)), text)
+        for term in sorted(locked_terms, key=lambda item: len(item["source"]), reverse=True):
+            pattern = re.compile(re.escape(term["source"]), flags=re.IGNORECASE)
+            protected = pattern.sub(lambda _m, target=term["target"]: placeholder(target), protected)
+        return protected, mapping
+
+    @staticmethod
+    def _restore_text(text: str, mapping: dict[str, str]) -> str:
+        restored = text
+        for token, value in mapping.items():
+            restored = restored.replace(token, value)
+            restored = restored.replace(token.lower(), value)
+        return restored
+
+    def _mt_cache_key(
+        self, text: str, target_language: str, locked_terms: Sequence[dict[str, str]]
+    ) -> str:
+        payload = {
+            "text": text,
+            "target": target_language,
+            "terms": list(locked_terms),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    def _translate_long_text(
+        self,
+        model_key: str,
+        protected_text: str,
+        target_language: str,
+    ) -> str:
+        limit = self.models.source_token_limit(model_key)
+        counter = lambda value: self.models.count_tokens(
+            model_key, f"<2{target_language}> {value}"
         )
+        pieces = _pieces_under_budget(protected_text, counter, max(64, limit - 12))
+        outputs: list[str] = []
+        batch_size = max(1, int(self.options.get("mt_long_piece_batch", 8)))
+        for start in range(0, len(pieces), batch_size):
+            self._check_cancelled()
+            outputs.extend(
+                self.models.translate_texts(
+                    model_key, pieces[start : start + batch_size], target_language
+                )
+            )
+        return " ".join(value.strip() for value in outputs if value.strip())
+
+    def _translate_work_items(
+        self,
+        model_key: str,
+        items: Sequence[tuple[str, str, int | None]],
+        target_language: str,
+        locked_terms: Sequence[dict[str, str]],
+        mt_cache: dict[str, str],
+    ) -> dict[tuple[str, int | None], str]:
+        results: dict[tuple[str, int | None], str] = {}
+        pending: list[tuple[str, int | None, str, dict[str, str], str]] = []
+        limit = self.models.source_token_limit(model_key)
+        for unit_id, text, segment_index in items:
+            if not text.strip():
+                results[(unit_id, segment_index)] = text
+                continue
+            cache_key = self._mt_cache_key(text, target_language, locked_terms)
+            if cache_key in mt_cache:
+                results[(unit_id, segment_index)] = mt_cache[cache_key]
+                continue
+            protected, mapping = self._protect_text(text, locked_terms)
+            count = self.models.count_tokens(model_key, f"<2{target_language}> {protected}")
+            if count > limit:
+                translated = self._translate_long_text(
+                    model_key, protected, target_language
+                )
+                translated = self._restore_text(translated, mapping)
+                mt_cache[cache_key] = translated
+                results[(unit_id, segment_index)] = translated
+            else:
+                pending.append((unit_id, segment_index, protected, mapping, cache_key))
+
+        batch_size = max(1, int(self.options.get("mt_batch_items", 12)))
+        for start in range(0, len(pending), batch_size):
+            self._check_cancelled()
+            block = pending[start : start + batch_size]
+            translated = self.models.translate_texts(
+                model_key, [item[2] for item in block], target_language
+            )
+            for item, value in zip(block, translated):
+                unit_id, segment_index, _protected, mapping, cache_key = item
+                restored = self._restore_text(value, mapping)
+                mt_cache[cache_key] = restored
+                results[(unit_id, segment_index)] = restored
+        return results
+
+    def _translate_batch_mt(
+        self,
+        model_key: str,
+        batch: Sequence[TranslationUnit],
+        target_language: str,
+        locked_terms: Sequence[dict[str, str]],
+        mt_cache: dict[str, str],
+    ) -> dict[str, list[str]]:
+        work: list[tuple[str, str, int | None]] = []
+        protected_units: set[str] = set()
+        for unit in batch:
+            protected = bool(unit.metadata.get("protected_segment_indices"))
+            if protected and len(unit.segments) > 1:
+                protected_units.add(unit.unit_id)
+                for index, segment in enumerate(unit.segments):
+                    work.append((unit.unit_id, segment, index))
+            else:
+                work.append((unit.unit_id, unit.text, None))
+        values = self._translate_work_items(
+            model_key, work, target_language, locked_terms, mt_cache
+        )
+        result: dict[str, list[str]] = {}
+        for unit in batch:
+            if unit.unit_id in protected_units:
+                result[unit.unit_id] = [
+                    values.get((unit.unit_id, index), segment)
+                    for index, segment in enumerate(unit.segments)
+                ]
+            else:
+                value = values.get((unit.unit_id, None), unit.text)
+                result[unit.unit_id] = (
+                    [value]
+                    if len(unit.segments) == 1
+                    else distribute_text(value, unit.segments)
+                )
+        return result
+
+    def _review_batch(
+        self,
+        model_key: str,
+        batch: Sequence[TranslationUnit],
+        drafts: dict[str, list[str]],
+        source_language: str,
+        target_language: str,
+        tone: str,
+        analysis: dict[str, Any],
+        pre_flags: dict[str, list[str]],
+        custom_instruction: str,
+    ) -> tuple[dict[str, list[str]], set[str]]:
+        locked = self._locked_terms(analysis)
+        payload = {
+            "source_language": LANGUAGES[source_language],
+            "target_language": LANGUAGES[target_language],
+            "tone": TONE_GUIDANCE.get(tone, tone),
+            "document_profile": {
+                "domain": analysis.get("domain", ""),
+                "audience": analysis.get("audience", ""),
+                "style": analysis.get("style", ""),
+                "summary": analysis.get("summary", ""),
+            },
+            "locked_glossary": locked,
+            "user_instruction": custom_instruction.strip(),
+            "units": [
+                {
+                    "id": unit.unit_id,
+                    "source": unit.segments,
+                    "draft": drafts[unit.unit_id],
+                    "qa_reasons": pre_flags.get(unit.unit_id, []),
+                    "protected_segment_indices": unit.metadata.get(
+                        "protected_segment_indices", []
+                    ),
+                }
+                for unit in batch
+            ],
+        }
+        system = (
+            "You are the semantic post-editor of a professional translation system. SOURCE is the "
+            "absolute authority; the machine-translation draft is only a proposal. Compare source and "
+            "draft carefully. If the draft is already correct and natural, keep it with minimal changes. "
+            "Fix mistranslation, omission, addition, negation, modality, terminology, idioms, register, "
+            "and unnatural Persian. Never invent information. Preserve every number, URL, email, proper "
+            "name, factual relation, and formatting segment count. Enforce locked_glossary exactly. "
+            "Return JSON: {\"translations\": {id: [same number of segments]}, \"polish\": [ids]}. "
+            "Put an id in polish only when the meaning is correct but Persian wording would benefit from "
+            "a Persian-specialist stylistic pass. No explanations or markdown."
+        )
+        data = self._llm_json_call(
+            model_key,
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            max_tokens=int(self.options.get("reserved_output_tokens", 1800)),
+            temperature=float(self.options.get("editor_temperature", 0.05)),
+        )
+        translations = data.get("translations", {})
+        if not isinstance(translations, dict):
+            raise TranslatorError("Semantic reviewer returned no translations object.")
+        result: dict[str, list[str]] = {}
+        for unit in batch:
+            candidate = translations.get(unit.unit_id, drafts[unit.unit_id])
+            try:
+                result[unit.unit_id] = normalize_translation_segments(unit, candidate)
+            except SegmentIntegrityError:
+                result[unit.unit_id] = drafts[unit.unit_id]
+        polish_raw = data.get("polish", [])
+        polish = {
+            str(item)
+            for item in polish_raw
+            if isinstance(polish_raw, list) and str(item) in {u.unit_id for u in batch}
+        }
+        return result, polish
+
+    def _polish_batch(
+        self,
+        model_key: str,
+        batch: Sequence[TranslationUnit],
+        candidates: dict[str, list[str]],
+        source_language: str,
+        target_language: str,
+        tone: str,
+        analysis: dict[str, Any],
+        reasons: dict[str, list[str]],
+    ) -> dict[str, list[str]]:
+        payload = {
+            "source_language": LANGUAGES[source_language],
+            "target_language": LANGUAGES[target_language],
+            "tone": TONE_GUIDANCE.get(tone, tone),
+            "locked_glossary": self._locked_terms(analysis),
+            "user_instruction": str(analysis.get("user_instruction", "")),
+            "units": [
+                {
+                    "id": unit.unit_id,
+                    "source": unit.segments,
+                    "translation": candidates[unit.unit_id],
+                    "reason": reasons.get(unit.unit_id, []),
+                    "protected_segment_indices": unit.metadata.get(
+                        "protected_segment_indices", []
+                    ),
+                }
+                for unit in batch
+            ],
+        }
+        system = (
+            "You are a Persian language specialist performing the final linguistic polish. Do not "
+            "re-translate from scratch. Preserve the source meaning and every fact exactly, but make the "
+            "Persian read as fluent, contemporary, publication-ready native prose appropriate to the "
+            "requested tone. Fix calques, awkward word order, collocations, punctuation and register. "
+            "Never change numbers, names, URLs, emails, terminology or segment counts. Return only JSON "
+            "{\"translations\": {id: [segments]}}."
+        )
+        data = self._llm_json_call(
+            model_key,
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            max_tokens=int(self.options.get("reserved_output_tokens", 1800)),
+            temperature=float(self.options.get("polisher_temperature", 0.08)),
+        )
+        translations = data.get("translations", {})
+        if not isinstance(translations, dict):
+            return {unit.unit_id: candidates[unit.unit_id] for unit in batch}
+        result: dict[str, list[str]] = {}
+        for unit in batch:
+            value = translations.get(unit.unit_id, candidates[unit.unit_id])
+            try:
+                result[unit.unit_id] = normalize_translation_segments(unit, value)
+            except SegmentIntegrityError:
+                result[unit.unit_id] = candidates[unit.unit_id]
+        return result
+
+    def _collect_issues(
+        self,
+        units: Sequence[TranslationUnit],
+        translations: dict[str, list[str]],
+        analysis: dict[str, Any],
+        target_language: str,
+    ) -> dict[str, list[str]]:
+        issues: dict[str, list[str]] = {}
+        qa_analysis = dict(analysis)
+        analysis_terms = analysis.get("terms", []) if isinstance(analysis.get("terms"), list) else []
+        configured_terms = self.options.get("locked_glossary", [])
+        if not isinstance(configured_terms, list):
+            configured_terms = []
+        qa_analysis["terms"] = [*analysis_terms, *configured_terms]
+        for unit in units:
+            target = "".join(translations.get(unit.unit_id, []))
+            flags = [
+                *quality_flags(unit.text, target, target_language),
+                *glossary_flags(unit.text, target, qa_analysis),
+            ]
+            if flags:
+                issues[unit.unit_id] = list(dict.fromkeys(flags))
+        return issues
+
+    def _repair_batch(
+        self,
+        model_key: str,
+        batch: Sequence[TranslationUnit],
+        candidates: dict[str, list[str]],
+        source_language: str,
+        target_language: str,
+        analysis: dict[str, Any],
+        flags: dict[str, list[str]],
+    ) -> dict[str, list[str]]:
+        payload = {
+            "source_language": LANGUAGES[source_language],
+            "target_language": LANGUAGES[target_language],
+            "locked_glossary": self._locked_terms(analysis),
+            "units": [
+                {
+                    "id": unit.unit_id,
+                    "source": unit.segments,
+                    "candidate": candidates[unit.unit_id],
+                    "failed_checks": flags.get(unit.unit_id, []),
+                }
+                for unit in batch
+            ],
+        }
+        system = (
+            "Repair only the listed deterministic failures. SOURCE is authoritative. Preserve natural "
+            "target-language prose, but restore missing or changed numbers, URLs, emails, locked terms "
+            "or omitted content. Do not make unrelated stylistic rewrites. Return JSON "
+            "{\"translations\": {id: [same number of segments]}}."
+        )
+        data = self._llm_json_call(
+            model_key,
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            max_tokens=int(self.options.get("reserved_output_tokens", 1800)),
+            temperature=0.0,
+        )
+        translations = data.get("translations", {})
+        result: dict[str, list[str]] = {}
+        for unit in batch:
+            value = translations.get(unit.unit_id, candidates[unit.unit_id]) if isinstance(translations, dict) else candidates[unit.unit_id]
+            try:
+                result[unit.unit_id] = normalize_translation_segments(unit, value)
+            except SegmentIntegrityError:
+                result[unit.unit_id] = candidates[unit.unit_id]
+        return result
 
     def run(
         self,
@@ -1400,39 +1618,32 @@ class TranslationPipeline:
         nonempty = [unit for unit in units if unit.text.strip()]
         if not nonempty:
             return {unit.unit_id: list(unit.segments) for unit in units}
+
         state = resume if isinstance(resume, dict) else {}
+        translator_key = str(self.profile["translator"])
+        reviewer_key = str(self.profile["reviewer"])
+        analyst_key = str(self.profile.get("analyst") or reviewer_key)
+        polisher_key = self.profile.get("polisher")
         quality_mode = str(self.options.get("quality_mode", "balanced")).lower()
         if quality_mode not in {"fast", "balanced", "strict"}:
             quality_mode = "balanced"
-        translator_key = self.profile["translator"]
-        reviewer_key = self.profile.get("reviewer", translator_key)
-        self.progress("analysis", 5, "در حال تحلیل موضوع، مخاطب و لحن سند")
-        analysis = state.get("analysis") or self._analyze(
-            nonempty, source_language, target_language, tone
-        )
+
+        self.progress("analysis", 5, "تحلیل حوزه، لحن و اصطلاحات سند با مدل بازبین")
+        analysis = state.get("analysis") if isinstance(state.get("analysis"), dict) else None
+        if not analysis:
+            analysis = self._analyze(nonempty, source_language, target_language, tone)
         if custom_instruction.strip():
             analysis["user_instruction"] = custom_instruction.strip()
         self.checkpoint("analysis", {"analysis": analysis})
+        # Do not keep Gemma resident while CTranslate2 loads MADLAD.
+        self.models.unload(analyst_key)
 
-        fixed_context = json.dumps(analysis, ensure_ascii=False)
-        # The editor sends source and draft together, so source units use at most half
-        # the otherwise available input budget from the beginning.
-        budget = max(64, self._batch_budget(translator_key, fixed_context) // 2)
-        working_units, split_mapping = prepare_units_for_budget(
-            nonempty,
-            lambda text: self.models.count_tokens(translator_key, text),
-            budget,
-        )
-        batches = adaptive_batches(
-            working_units,
-            lambda text: self.models.count_tokens(translator_key, text),
-            budget,
-            int(self.profile.get("max_units_per_request", 6)),
-        )
-        manifest = build_checkpoint_manifest(
-            self.config, self.profile, working_units, budget
-        )
-        drafts, finals = reusable_checkpoint_translations(state, manifest)
+        # The MT model itself has a short encoder context (MADLAD is normally 512 tokens),
+        # so batching is by units while oversized paragraphs are split internally.
+        budget = self.models.source_token_limit(translator_key)
+        working_units = nonempty
+        manifest = build_checkpoint_manifest(self.config, self.profile, working_units, budget)
+        drafts, finals, polished, mt_cache = reusable_checkpoint_translations(state, manifest)
         self.checkpoint(
             "manifest",
             {
@@ -1440,70 +1651,79 @@ class TranslationPipeline:
                 "manifest": manifest,
                 "drafts": drafts,
                 "finals": finals,
+                "polished": polished,
+                "mt_cache": mt_cache,
             },
         )
-        previous: list[dict[str, str]] = []
-        refresh_every = max(1, int(self.options.get("summary_refresh_batches", 6)))
-        for index, batch in enumerate(batches):
+
+        locked_terms = self._locked_terms(analysis)
+        mt_unit_batch = max(1, int(self.options.get("mt_units_per_batch", 10)))
+        mt_batches = [
+            working_units[i : i + mt_unit_batch]
+            for i in range(0, len(working_units), mt_unit_batch)
+        ]
+        for index, batch in enumerate(mt_batches):
             self._check_cancelled()
             pending = [unit for unit in batch if unit.unit_id not in drafts]
             if pending:
-                translated = self._translate_batch(
-                    translator_key,
-                    pending,
-                    source_language,
-                    target_language,
-                    tone,
-                    analysis,
-                    previous,
+                drafts.update(
+                    self._translate_batch_mt(
+                        translator_key,
+                        pending,
+                        target_language,
+                        locked_terms,
+                        mt_cache,
+                    )
                 )
-                drafts.update(translated)
                 self.checkpoint(
                     "draft",
-                    {"analysis": analysis, "manifest": manifest, "drafts": drafts},
+                    {
+                        "analysis": analysis,
+                        "manifest": manifest,
+                        "drafts": drafts,
+                        "mt_cache": mt_cache,
+                    },
                 )
-            for unit in batch:
-                previous.append(
-                    {"source": unit.text, "target": "".join(drafts[unit.unit_id])}
-                )
-            previous = previous[-int(self.options.get("previous_units", 3)) :]
-            if (
-                pending
-                and (index + 1) % refresh_every == 0
-                and index + 1 < len(batches)
-            ):
-                try:
-                    analysis = self._refresh_analysis(
-                        translator_key, analysis, batch, drafts
-                    )
-                    self.checkpoint(
-                        "context",
-                        {"analysis": analysis, "manifest": manifest, "drafts": drafts},
-                    )
-                except TranslatorError:
-                    # A compact-memory refresh is helpful but must not discard completed translation work.
-                    pass
             self.progress(
                 "translation",
-                15 + int(45 * (index + 1) / max(1, len(batches))),
-                f"ترجمه اولیه: بخش {index + 1} از {len(batches)}",
+                12 + int(38 * (index + 1) / max(1, len(mt_batches))),
+                f"ترجمه تخصصی MADLAD: بخش {index + 1} از {len(mt_batches)}",
             )
 
-        if reviewer_key != translator_key:
-            self.models.unload()
-        fixed_context = json.dumps(analysis, ensure_ascii=False)
-        edit_budget = max(64, self._batch_budget(reviewer_key, fixed_context) // 2)
-        edit_batches = adaptive_batches(
-            working_units,
-            lambda text: self.models.count_tokens(reviewer_key, text),
-            edit_budget,
-            int(self.profile.get("max_units_per_request", 6)),
+        # Free the large translation model before loading Gemma through llama.cpp.
+        self.models.unload(translator_key)
+        pre_flags = self._collect_issues(working_units, drafts, analysis, target_language)
+        self.progress("review", 52, "بازبینی معنایی ترجمه با Gemma 3")
+
+        reviewer_context = int(
+            self.config.get("models", {}).get(reviewer_key, {}).get("context_size", 32768)
         )
-        for index, batch in enumerate(edit_batches):
+        review_budget = max(800, int(reviewer_context * 0.34))
+        review_batches = adaptive_batches(
+            working_units,
+            lambda text: self.models.count_tokens(reviewer_key, text) * 2,
+            review_budget,
+            max(1, int(self.profile.get("max_units_per_request", 6))),
+        )
+        for index, batch in enumerate(review_batches):
             self._check_cancelled()
-            pending = [unit for unit in batch if unit.unit_id not in finals]
+            if quality_mode == "fast":
+                pending = [
+                    unit
+                    for unit in batch
+                    if unit.unit_id not in finals and unit.unit_id in pre_flags
+                ]
+                untouched = [
+                    unit
+                    for unit in batch
+                    if unit.unit_id not in finals and unit.unit_id not in pre_flags
+                ]
+                for unit in untouched:
+                    finals[unit.unit_id] = drafts[unit.unit_id]
+            else:
+                pending = [unit for unit in batch if unit.unit_id not in finals]
             if pending:
-                edited = self._edit_batch(
+                edited, polish_ids = self._review_batch(
                     reviewer_key,
                     pending,
                     drafts,
@@ -1511,153 +1731,158 @@ class TranslationPipeline:
                     target_language,
                     tone,
                     analysis,
+                    pre_flags,
+                    custom_instruction,
                 )
                 finals.update(edited)
+                self._polish_hints.update(polish_ids)
                 self.checkpoint(
-                    "editing",
+                    "review",
                     {
                         "analysis": analysis,
                         "manifest": manifest,
                         "drafts": drafts,
                         "finals": finals,
+                        "polish_hints": sorted(self._polish_hints),
+                        "mt_cache": mt_cache,
                     },
                 )
             self.progress(
-                "editing",
-                60 + int(20 * (index + 1) / max(1, len(edit_batches))),
-                f"ویرایش زبان مقصد: بخش {index + 1} از {len(edit_batches)}",
+                "review",
+                52 + int(23 * (index + 1) / max(1, len(review_batches))),
+                f"بازبینی معنایی: بخش {index + 1} از {len(review_batches)}",
             )
 
-        fidelity: dict[str, list[str]] = {}
-        if quality_mode == "strict":
-            for index, batch in enumerate(edit_batches):
+        # Resume can restore polish hints generated in a previous attempt.
+        previous_hints = state.get("polish_hints", [])
+        if isinstance(previous_hints, list):
+            self._polish_hints.update(str(x) for x in previous_hints)
+
+        after_review_flags = self._collect_issues(
+            working_units, finals, analysis, target_language
+        )
+        selected_for_polish: set[str] = set(after_review_flags)
+        selected_for_polish.update(self._polish_hints)
+        if quality_mode == "strict" and target_language == "fa":
+            # In strict mode Dorna sees every reviewed unit, but it still receives the
+            # reviewed translation rather than translating from scratch.
+            selected_for_polish.update(unit.unit_id for unit in working_units)
+
+        if target_language == "fa" and polisher_key and selected_for_polish:
+            self.models.unload(reviewer_key)
+            polish_units = [
+                unit for unit in working_units if unit.unit_id in selected_for_polish
+            ]
+            polish_batches = adaptive_batches(
+                polish_units,
+                lambda text: self.models.count_tokens(str(polisher_key), text) * 2,
+                max(700, int(self.config.get("models", {}).get(str(polisher_key), {}).get("context_size", 8192) * 0.30)),
+                max(1, int(self.profile.get("polisher_max_units", 4))),
+            )
+            for index, batch in enumerate(polish_batches):
                 self._check_cancelled()
-                fidelity.update(
-                    self._fidelity_batch(
-                        reviewer_key,
-                        batch,
-                        finals,
-                        source_language,
-                        target_language,
-                        analysis,
+                pending = [unit for unit in batch if unit.unit_id not in polished]
+                if pending:
+                    polished.update(
+                        self._polish_batch(
+                            str(polisher_key),
+                            pending,
+                            finals,
+                            source_language,
+                            target_language,
+                            tone,
+                            analysis,
+                            after_review_flags,
+                        )
                     )
-                )
+                    self.checkpoint(
+                        "polish",
+                        {
+                            "analysis": analysis,
+                            "manifest": manifest,
+                            "drafts": drafts,
+                            "finals": finals,
+                            "polished": polished,
+                            "polish_hints": sorted(self._polish_hints),
+                            "mt_cache": mt_cache,
+                        },
+                    )
                 self.progress(
-                    "quality",
-                    80 + int(7 * (index + 1) / max(1, len(edit_batches))),
-                    f"داوری وفاداری: بخش {index + 1} از {len(edit_batches)}",
+                    "polish",
+                    76 + int(12 * (index + 1) / max(1, len(polish_batches))),
+                    f"روان‌سازی فارسی با Dorna: بخش {index + 1} از {len(polish_batches)}",
                 )
-        else:
-            self.progress(
-                "quality",
-                87,
-                "کنترل سریع اعداد، پیوندها، ایمیل و یکپارچگی خروجی",
-            )
+            self.models.unload(str(polisher_key))
 
-        def collect_issues(
-            candidates: Sequence[TranslationUnit],
-        ) -> dict[str, list[str]]:
-            issues: dict[str, list[str]] = {}
-            for candidate in candidates:
-                target = "".join(finals[candidate.unit_id])
-                combined = [
-                    *quality_flags(candidate.text, target),
-                    *glossary_flags(candidate.text, target, analysis),
-                    *fidelity.get(candidate.unit_id, []),
-                ]
-                if combined:
-                    issues[candidate.unit_id] = list(dict.fromkeys(combined))
-            return issues
+        combined = dict(finals)
+        combined.update(polished)
+        unresolved = self._collect_issues(
+            working_units, combined, analysis, target_language
+        )
 
-        units_by_id = {unit.unit_id: unit for unit in working_units}
-        unresolved = collect_issues(working_units)
-        configured_repairs = max(
-            0, int(self.options.get("quality_repair_attempts", 2))
-        )
-        repair_attempts = (
-            configured_repairs
-            if quality_mode == "strict"
-            else min(1, configured_repairs)
-        )
+        # Only deterministic integrity problems are auto-repaired. Stylistic flags
+        # remain warnings and never prevent the user from receiving a file.
+        blocking_codes = {"empty", "numbers", "urls", "emails", "placeholder"}
+        repair_flags = {
+            unit_id: [flag for flag in flags if flag.split(":", 1)[0] in blocking_codes]
+            for unit_id, flags in unresolved.items()
+        }
+        repair_flags = {k: v for k, v in repair_flags.items() if v}
+        repair_attempts = max(0, int(self.options.get("quality_repair_attempts", 1)))
         for attempt in range(repair_attempts):
-            if not unresolved:
+            if not repair_flags:
                 break
-            repaired_units: list[TranslationUnit] = []
-            for index, (unit_id, flags) in enumerate(list(unresolved.items())):
-                self._check_cancelled()
-                unit = units_by_id[unit_id]
-                finals[unit_id] = self._repair_unit(
+            self.models.unload(str(polisher_key) if polisher_key else None)
+            repair_units = [unit for unit in working_units if unit.unit_id in repair_flags]
+            repair_batches = adaptive_batches(
+                repair_units,
+                lambda text: self.models.count_tokens(reviewer_key, text) * 2,
+                review_budget,
+                max(1, int(self.profile.get("max_units_per_request", 6))),
+            )
+            for batch in repair_batches:
+                repaired = self._repair_batch(
                     reviewer_key,
-                    unit,
-                    finals[unit_id],
-                    flags,
-                    source_language,
-                    target_language,
-                )
-                repaired_units.append(unit)
-                self.progress(
-                    "quality",
-                    87 + int(3 * (index + 1) / max(1, len(unresolved))),
-                    f"اصلاح کیفیت: تلاش {attempt + 1}، مورد {index + 1} از {len(unresolved)}",
-                )
-            if quality_mode == "strict":
-                fidelity = self._fidelity_batch(
-                    reviewer_key,
-                    repaired_units,
-                    finals,
+                    batch,
+                    combined,
                     source_language,
                     target_language,
                     analysis,
+                    repair_flags,
                 )
-            else:
-                fidelity = {}
-            unresolved = collect_issues(repaired_units)
-            self.checkpoint(
-                "quality_repair",
-                {
-                    "analysis": analysis,
-                    "manifest": manifest,
-                    "drafts": drafts,
-                    "finals": finals,
-                },
+                combined.update(repaired)
+            unresolved = self._collect_issues(
+                working_units, combined, analysis, target_language
             )
-        self.quality_warnings = unresolved
-        if unresolved and quality_mode == "strict" and not bool(
-            self.options.get("allow_output_with_warnings", False)
-        ):
-            details = "; ".join(
-                f"{unit_id}: {', '.join(flags[:3])}"
-                for unit_id, flags in list(unresolved.items())[:5]
-            )
-            raise TranslatorError(
-                "Quality control could not resolve critical fidelity issues: " + details
-            )
-        self.checkpoint(
-            "quality",
-            {
-                "analysis": analysis,
-                "manifest": manifest,
-                "drafts": drafts,
-                "finals": finals,
-                "quality_warnings": self.quality_warnings,
-            },
-        )
-        if self.quality_warnings:
-            warning_count = sum(len(items) for items in self.quality_warnings.values())
+            repair_flags = {
+                unit_id: [
+                    flag
+                    for flag in flags
+                    if flag.split(":", 1)[0] in blocking_codes
+                ]
+                for unit_id, flags in unresolved.items()
+            }
+            repair_flags = {k: v for k, v in repair_flags.items() if v}
             self.progress(
                 "quality",
-                90,
-                f"کنترل کیفیت تکمیل شد؛ خروجی با {warning_count} هشدار قابل دانلود خواهد بود",
+                89 + min(4, attempt + 1),
+                f"کنترل قطعی و ترمیم داده‌ها: تلاش {attempt + 1}",
             )
-        else:
-            self.progress("quality", 90, "کنترل وفاداری و یکپارچگی تکمیل شد")
-        self.models.unload()
-        reassembled = reassemble_split_units(
-            nonempty, working_units, split_mapping, finals
+
+        self.quality_warnings = unresolved
+        self.progress(
+            "quality",
+            94,
+            (
+                f"کنترل نهایی تمام شد؛ {sum(len(v) for v in unresolved.values())} هشدار باقی مانده"
+                if unresolved
+                else "کنترل نهایی بدون هشدار قطعی پایان یافت"
+            ),
         )
-        for unit in units:
-            reassembled.setdefault(unit.unit_id, list(unit.segments))
-        return reassembled
+
+        result = {unit.unit_id: list(unit.segments) for unit in units}
+        result.update(combined)
+        return result
 
 
 class TextArtifact:
@@ -3087,11 +3312,15 @@ def _safe_upload_name(filename: str, expected_suffix: str) -> str:
     return stem + expected_suffix
 
 
+
 def _dependency_status() -> dict[str, bool]:
     import importlib.util
 
     return {
         "flask": importlib.util.find_spec("flask") is not None,
+        "ctranslate2": importlib.util.find_spec("ctranslate2") is not None,
+        "transformers": importlib.util.find_spec("transformers") is not None,
+        "sentencepiece": importlib.util.find_spec("sentencepiece") is not None,
         "llama_cpp": importlib.util.find_spec("llama_cpp") is not None,
         "lxml": importlib.util.find_spec("lxml") is not None,
         "python_docx": importlib.util.find_spec("docx") is not None,
@@ -3102,21 +3331,51 @@ def _dependency_status() -> dict[str, bool]:
 def build_doctor_report(
     config: dict[str, Any], probe_model: bool = False
 ) -> dict[str, Any]:
-    """Build one truthful readiness report for both the CLI and web endpoint."""
     dependencies = _dependency_status()
     backend = detect_runtime_backend()
-    models = {
-        key: {
-            "path": value.get("path"),
-            "exists": Path(str(value.get("path", ""))).is_file(),
-        }
-        for key, value in config.get("models", {}).items()
-    }
+    llm_acceleration = detect_llama_acceleration() if dependencies.get("llama_cpp") else "unavailable"
+    models: dict[str, Any] = {}
+    for key, value in config.get("models", {}).items():
+        if not isinstance(value, dict):
+            continue
+        model_backend = str(value.get("backend", ""))
+        item: dict[str, Any] = {"backend": model_backend}
+        if model_backend == "ctranslate2":
+            path = Path(str(value.get("path", "")))
+            item.update({"path": str(path), "exists": (path / "model.bin").is_file()})
+            try:
+                device, compute = ModelManager._resolve_ct2_runtime(value)
+                item.update({"runtime_device": device, "compute_type": compute})
+            except Exception as exc:
+                item["runtime_error"] = str(exc)
+        elif model_backend == "llama_cpp":
+            path = Path(str(value.get("path", "")))
+            item.update(
+                {
+                    "path": str(path),
+                    "exists": path.is_file(),
+                    "gpu_layers": ModelManager._gpu_layers_for(value),
+                    "acceleration": llm_acceleration,
+                }
+            )
+        else:
+            item["exists"] = False
+        models[key] = item
+
     errors: list[str] = []
-    required = ("flask", "llama_cpp", "lxml", "python_docx", "pymupdf")
-    missing = [name for name in required if not dependencies.get(name)]
-    if missing:
-        errors.append("Missing Python packages: " + ", ".join(missing))
+    required = (
+        "flask",
+        "ctranslate2",
+        "transformers",
+        "sentencepiece",
+        "llama_cpp",
+        "lxml",
+        "python_docx",
+        "pymupdf",
+    )
+    missing_deps = [name for name in required if not dependencies.get(name)]
+    if missing_deps:
+        errors.append("Missing Python packages: " + ", ".join(missing_deps))
 
     try:
         profile_name, profile = choose_profile(config)
@@ -3124,42 +3383,63 @@ def build_doctor_report(
         profile_name, profile = "unavailable", {}
         errors.append(str(exc))
 
-    probe: dict[str, Any] = {"requested": bool(probe_model), "ok": None}
-    if probe_model:
-        if profile_name == "unavailable" or backend == "unavailable":
-            probe.update(
-                {"ok": False, "error": "Runtime is not ready for a model probe."}
+    if sys.platform == "darwin" and dependencies.get("llama_cpp") and llm_acceleration != "metal":
+        errors.append(
+            "llama-cpp-python is installed without active Metal GPU offload. "
+            "Reinstall a Metal-enabled arm64 build for GPU acceleration."
+        )
+
+    probe: dict[str, Any] = {"requested": bool(probe_model), "ok": None, "steps": {}}
+    if probe_model and profile_name != "unavailable" and not missing_deps:
+        manager = ModelManager(config, profile)
+        try:
+            translator_key = str(profile.get("translator", ""))
+            reviewer_key = str(profile.get("reviewer", ""))
+            polisher_key = str(profile.get("polisher") or "")
+
+            mt = manager.translate_texts(translator_key, ["Hello world."], "fa")[0]
+            probe["steps"]["madlad"] = {"ok": bool(mt.strip()), "sample": mt[:120]}
+            manager.unload(translator_key)
+
+            llm = manager.generate_json(
+                reviewer_key,
+                [{"role": "user", "content": 'Return only JSON: {"ok": true}'}],
+                max_tokens=32,
+                temperature=0.0,
             )
-        else:
-            manager = ModelManager(config, profile)
-            model_key = str(profile.get("translator", ""))
-            try:
-                prompt = 'Reply with a JSON object containing only: {"ok": true}'
-                token_count = manager.count_tokens(model_key, prompt)
-                response = manager.generate(
-                    model_key,
-                    [{"role": "user", "content": prompt}],
+            probe["steps"]["reviewer"] = {"ok": llm.get("ok") is True}
+            manager.unload(reviewer_key)
+
+            if polisher_key:
+                polish = manager.generate_json(
+                    polisher_key,
+                    [{"role": "user", "content": 'فقط این JSON را برگردان: {"ok": true}'}],
                     max_tokens=32,
                     temperature=0.0,
                 )
-                if not response.strip():
-                    raise TranslatorError("The model probe returned an empty response.")
-                probe.update(
-                    {"ok": True, "model": model_key, "prompt_tokens": token_count}
-                )
-            except Exception as exc:  # noqa: BLE001 - diagnostic boundary
-                probe.update({"ok": False, "model": model_key, "error": str(exc)})
-                errors.append(f"Model probe failed: {exc}")
-            finally:
-                manager.unload()
+                probe["steps"]["polisher"] = {"ok": polish.get("ok") is True}
+                manager.unload(polisher_key)
 
-    healthy = not errors and backend != "unavailable"
+            if not mt.strip() or llm.get("ok") is not True:
+                raise TranslatorError("Direct-GGUF probe did not return expected outputs.")
+            if polisher_key and probe["steps"].get("polisher", {}).get("ok") is not True:
+                raise TranslatorError("Dorna GGUF probe did not return expected output.")
+            probe["ok"] = True
+        except Exception as exc:
+            probe.update({"ok": False, "error": str(exc)})
+            errors.append(f"Model probe failed: {exc}")
+        finally:
+            manager.unload()
+
+    healthy = not errors and backend != "incomplete"
     return {
         "app_version": APP_VERSION,
         "status": "ok" if healthy else "incomplete",
         "platform": platform.platform(),
+        "python_arch": platform.machine(),
         "memory_gb": round(total_memory_bytes() / 1024**3, 1),
         "backend": backend,
+        "llm_acceleration": llm_acceleration,
         "profile": profile_name,
         "profile_config": profile,
         "dependencies": dependencies,
@@ -3190,7 +3470,7 @@ INDEX_HTML = r"""<!doctype html>
   </style>
 </head>
 <body><main>
-  <header><div class="eyebrow">LOCAL · PRIVATE · ADAPTIVE · نسخه __APP_VERSION__</div><h1>مترجم محلی اسناد</h1><p>ترجمهٔ طبیعی و چندمرحله‌ای با مدل‌های GGUF شما؛ همراه با حفظ ساختار Word، بازسازی PDF و نمایش زندهٔ پیشرفت.</p><div id="runtimeHealth" class="muted">در حال بررسی آمادگی سیستم…</div></header>
+  <header><div class="eyebrow">LOCAL · PRIVATE · MADLAD + DIRECT GGUF · نسخه __APP_VERSION__</div><h1>مترجم محلی اسناد</h1><p>خط لولهٔ محلی MADLAD + Gemma 3 GGUF + Dorna GGUF؛ اجرای مستقیم llama.cpp با Metal روی مک و CUDA/GPU offload در سیستم‌های سازگار.</p><div id="runtimeHealth" class="muted">در حال بررسی آمادگی سیستم…</div></header>
   <section class="card" id="formCard"><form id="jobForm"><input type="hidden" name="csrf_token" value="__CSRF_TOKEN__">
     <div class="switch"><button type="button" class="active" data-type="text">متن</button><button type="button" data-type="docx">Word</button><button type="button" data-type="pdf">PDF</button></div>
     <input type="hidden" name="input_type" id="inputType" value="text">
@@ -3250,7 +3530,7 @@ document.getElementById('pause').onclick=()=>jobAction('pause');document.getElem
 document.getElementById('delete').onclick=async()=>{if(confirm('این تسک، checkpoint و فایل‌هایش حذف شود؟')&&await jobAction('', 'DELETE')){if(events)events.close();localStorage.removeItem('translatorJobId');currentJob=null;document.getElementById('statusCard').classList.add('hidden');await loadJobs()}};
 document.getElementById('newTask').onclick=()=>{form.reset();document.querySelector('.switch button[data-type="text"]').click();document.getElementById('formCard').scrollIntoView({behavior:'smooth'});document.getElementById('text').focus()};
 document.getElementById('clearJobs').onclick=async()=>{if(!confirm('همهٔ تسک‌های متوقف، تمام‌شده، ناموفق و لغوشده حذف شوند؟'))return;const res=await fetch('/api/jobs/clear',{method:'POST',headers:{'X-CSRF-Token':csrfToken}});if(res.ok){const data=await res.json();setText('formMessage',data.deleted+' تسک حذف شد');await loadJobs()}};
-async function loadDoctor(){const res=await fetch('/api/doctor'),report=await res.json(),el=document.getElementById('runtimeHealth');const existing=Object.entries(report.models||{}).filter(([,value])=>value.exists).map(([key])=>key);el.textContent='آمادگی سیستم: '+(report.status==='ok'?'آماده':'ناقص')+' · Backend: '+report.backend+' · پروفایل: '+report.profile+' · مدل‌های موجود: '+(existing.join('، ')||'هیچ‌کدام');if(report.errors&&report.errors.length)el.title=report.errors.join('\n')}
+async function loadDoctor(){const res=await fetch('/api/doctor'),report=await res.json(),el=document.getElementById('runtimeHealth');const existing=Object.entries(report.models||{}).filter(([,value])=>value.exists).map(([key])=>key);el.textContent='آمادگی سیستم: '+(report.status==='ok'?'آماده':'ناقص')+' · Backend: '+report.backend+' · شتاب LLM: '+(report.llm_acceleration||'—')+' · پروفایل: '+report.profile+' · مدل‌ها: '+(existing.join('، ')||'هیچ‌کدام');if(report.errors&&report.errors.length)el.title=report.errors.join('\n')}
 loadDoctor();loadJobs();const savedJob=localStorage.getItem('translatorJobId');if(savedJob)selectJob(savedJob);
 </script></body></html>"""
 
@@ -3505,7 +3785,7 @@ def create_app(config: dict[str, Any], start_worker: bool = True) -> Any:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Local LLM document translator")
+    parser = argparse.ArgumentParser(description="Local hybrid MT + LLM document translator")
     parser.add_argument(
         "--config",
         default=os.environ.get("TRANSLATOR_CONFIG", "translator.config.json"),
@@ -3516,7 +3796,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--probe-model",
         action="store_true",
-        help="With --doctor, also load the selected GGUF and run a tiny inference",
+        help="With --doctor, also load the selected MT/reviewer models and run a tiny inference",
     )
     parser.add_argument("--host", help="Override the configured bind address")
     parser.add_argument("--port", type=int, help="Override the configured port")
